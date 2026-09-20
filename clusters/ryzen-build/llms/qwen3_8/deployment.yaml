@@ -12,14 +12,14 @@ spec:
     app: qwen38-27b
   ports:
     - name: http
-      port: 8000
+      port: 8080
       targetPort: http
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: qwen38-27b
-  namespace: llm
+  namespace: qwen38
   labels:
     app: qwen38-27b
 spec:
@@ -34,6 +34,12 @@ spec:
       labels:
         app: qwen38-27b
     spec:
+      # # Requires the AMD GPU device plugin (or the AMD GPU Operator) on the node.
+      # # It injects /dev/kfd and /dev/dri for you; the hostPath mounts below are
+      # # only a fallback for clusters running neither.
+      # nodeSelector:
+      #   amd.com/gpu.device-id: "744c"     # Navi 31 / 7900 XTX. Drop or adjust if
+      #                                     # your nodes aren't labelled by the operator.
       securityContext:
         # ROCm needs access to the render node. Check the GID on the node:
         #   getent group render video
@@ -51,12 +57,19 @@ spec:
           command: ["vllm", "serve"]
           args:
             - "mattbucci/Qwen3.8-27B-AWQ"
+            # llama-server --alias
             - "--served-model-name"
-            - "qwen3.8-27b"
+            - "unsloth/Qwen3.8-27B-GGUF:UD-Q4"
             - "--host"
             - "0.0.0.0"
+            # llama-server --port 8080
             - "--port"
-            - "8000"
+            - "8080"
+            # NOTE: your llama.cpp config used --cache-type-k/-v q4_0. vLLM has no
+            # 4-bit KV cache; its only quantized option is fp8, which measured
+            # SLOWER than bf16 on gfx1100 (no native FP8 -> software upcast).
+            # So KV is 16-bit here: ~4x the memory per token vs. your q4_0 setup,
+            # and correspondingly less context in the same 24 GiB.
             - "--max-model-len"
             - "24576"
             # vLLM's memory profiling does not account for the gated-DeltaNet
@@ -64,20 +77,52 @@ spec:
             # this rather than raising it.
             - "--gpu-memory-utilization"
             - "0.90"
+            # llama-server --parallel 1 / -np 1
             - "--max-num-seqs"
-            - "32"
-            # - "--cudagraph-capture-sizes"
-            # - "1,2,4,8,16,32"
-            # Qwen3.8 thinking + tool calling
+            - "1"
+            - "--cudagraph-capture-sizes"
+            - "1"
+            # llama-server --reasoning-format deepseek
             - "--reasoning-parser"
             - "qwen3"
             - "--enable-auto-tool-choice"
             - "--tool-call-parser"
             - "qwen3_coder"
+            # REQUIRED for this checkpoint. Without it, vLLM tries to build AWQ
+            # weights for the vision tower's linear layers, whose input dims are
+            # not a multiple of the AWQ group size (128), and dies at load with:
+            #   ValueError: The input size is not aligned with the quantized
+            #   weight shape. This can be caused by too large tensor parallel size.
+            # (That TP hint is misleading — it fails identically at TP=1.)
+            # This flag skips the vision tower at load entirely. Text-only.
+            - "--language-model-only"
+            # llama-server --no-mmproj-offload. Belt and braces: the flag above is
+            # what actually prevents the tower being built. This only limits what
+            # requests may carry, and does NOT fix the load-time crash on its own.
+            - "--limit-mm-per-prompt"
+            - '{"image": 0}'
+            # llama-server --spec-type draft-mtp. Verify this checkpoint actually
+            # ships the MTP head before enabling — not every AWQ build keeps it,
+            # and the engine will fail to start if the tensors are absent.
+            # - "--speculative-config"
+            # - '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'
+            #
+            # No equivalent needed for: --jinja (chat template applied by default),
+            # -ngl -1 (always fully on GPU), --no-webui (no web UI exists).
+            #
+            # Leave --kv-cache-dtype unset. It defaults to auto, which on this
+            # checkpoint means bf16 — what you want. (Note: a compressed-tensors
+            # checkpoint carrying a kv_cache_scheme would be silently forced to
+            # fp8 here, which is ~2x slower per context-token on RDNA3 because
+            # gfx11 has no native FP8. AWQ checkpoints don't carry that field.)
+            #
+            # If AWQ kernels throw dtype errors on gfx1100, try --dtype float16.
+            # Default (bfloat16) is the better starting point for this model.
           env:
             - name: HF_HOME
               value: /models
-            - name: HF_HUB_ENABLE_HF_TRANSFER
+            # HF_HUB_ENABLE_HF_TRANSFER is deprecated; this is its replacement.
+            - name: HF_XET_HIGH_PERFORMANCE
               value: "1"
             # Standard ROCm setup for this card.
             - name: FLASH_ATTENTION_TRITON_AMD_ENABLE
@@ -85,9 +130,14 @@ spec:
             # gfx1100 is natively supported — do NOT set HSA_OVERRIDE_GFX_VERSION.
             - name: VLLM_LOGGING_LEVEL
               value: INFO
+            # - name: HUGGING_FACE_HUB_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: hf-token
+            #       key: token
           ports:
             - name: http
-              containerPort: 8000
+              containerPort: 8080
           resources:
             limits:
               amd.com/gpu: 1
