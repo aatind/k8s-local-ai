@@ -35,18 +35,12 @@ spec:
       labels:
         app: qwen38-27b
     spec:
-      # Requires the AMD GPU device plugin (or the AMD GPU Operator) on the node.
-      # It injects /dev/kfd and /dev/dri for you; the hostPath mounts below are
-      # only a fallback for clusters running neither.
-      nodeSelector:
-        amd.com/gpu.device-id: "744c"     # Navi 31 / 7900 XTX. Drop or adjust if
-                                          # your nodes aren't labelled by the operator.
       securityContext:
         # ROCm needs access to the render node. Check the GID on the node:
         #   getent group render video
         supplementalGroups:
           - 44    # video
-          - 110   # render  <-- verify this, it differs between distros
+          - 991   # render  <-- verify this, it differs between distros
         seccompProfile:
           type: Unconfined
       terminationGracePeriodSeconds: 60
