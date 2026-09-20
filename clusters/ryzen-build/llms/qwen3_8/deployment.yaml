@@ -60,8 +60,8 @@ spec:
           args:
             - "mattbucci/Qwen3.8-27B-AWQ"
             # llama-server --alias
-            - "--served-model-name"
-            - "Qwen3.8-27B"
+            # - "--served-model-name"
+            # - "Qwen3.8-27B"
             # - "--host"
             # - "0.0.0.0"
             # llama-server --port 8080
