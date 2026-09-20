@@ -58,7 +58,7 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
-            - "mattbucci/Qwen3.8-27B-AWQ"
+            - "julianmb/Qwen-3.8-27B-ROCmFP4-FAST-GGUF"
             # llama-server --alias
             # - "--served-model-name"
             # - "Qwen3.8-27B"
