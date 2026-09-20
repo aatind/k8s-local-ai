@@ -6,4 +6,4 @@ resources:
 - namespace.yaml
 - pvc.yaml
 - deployment.yaml
-- hf-token-secret
+- misc-secret.yaml
