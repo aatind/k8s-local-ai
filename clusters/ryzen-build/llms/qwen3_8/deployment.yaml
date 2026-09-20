@@ -14,6 +14,7 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -34,21 +35,69 @@ spec:
       labels:
         app: qwen38-27b
     spec:
-      # # Requires the AMD GPU device plugin (or the AMD GPU Operator) on the node.
-      # # It injects /dev/kfd and /dev/dri for you; the hostPath mounts below are
-      # # only a fallback for clusters running neither.
-      # nodeSelector:
-      #   amd.com/gpu.device-id: "744c"     # Navi 31 / 7900 XTX. Drop or adjust if
-      #                                     # your nodes aren't labelled by the operator.
+      # Requires the AMD GPU device plugin (or the AMD GPU Operator) on the node.
+      # It injects /dev/kfd and /dev/dri for you; the hostPath mounts below are
+      # only a fallback for clusters running neither.
+      nodeSelector:
+        amd.com/gpu.device-id: "744c"     # Navi 31 / 7900 XTX. Drop or adjust if
+                                          # your nodes aren't labelled by the operator.
       securityContext:
         # ROCm needs access to the render node. Check the GID on the node:
         #   getent group render video
         supplementalGroups:
           - 44    # video
-          - 991   # render  <-- verify this, it differs between distros
+          - 110   # render  <-- verify this, it differs between distros
         seccompProfile:
           type: Unconfined
       terminationGracePeriodSeconds: 60
+      initContainers:
+        # mattbucci/Qwen3.8-27B-AWQ ships "modules_to_not_convert": [] in its
+        # quantization_config, so vLLM tries to build AWQ weights for the vision
+        # tower too. The tower's intermediate_size is 4304, which is not a
+        # multiple of the AWQ group_size (128), so model init dies with:
+        #   ValueError: The input size is not aligned with the quantized weight shape.
+        # The checkpoint works in SGLang, which it was built on; vLLM needs the
+        # exclusion list to know those weights are stored unquantized.
+        # This fetches the repo once and patches that one field. Idempotent.
+        - name: fetch-and-patch
+          image: rocm/vllm:latest
+          command: ["python3", "-c"]
+          args:
+            - |
+              import json, os
+              from huggingface_hub import snapshot_download
+              target = "/models/qwen3.8-27b-awq"
+              path = snapshot_download(
+                  "mattbucci/Qwen3.8-27B-AWQ",
+                  local_dir=target,
+              )
+              cfg_path = os.path.join(path, "config.json")
+              with open(cfg_path) as f:
+                  cfg = json.load(f)
+              qc = cfg.get("quantization_config", {})
+              if "visual" not in qc.get("modules_to_not_convert") or []:
+                  qc["modules_to_not_convert"] = ["visual"]
+                  cfg["quantization_config"] = qc
+                  with open(cfg_path, "w") as f:
+                      json.dump(cfg, f, indent=2)
+                  print("patched modules_to_not_convert -> ['visual']")
+              else:
+                  print("already patched")
+          env:
+            - name: HF_HOME
+              value: /models
+            - name: HF_XET_HIGH_PERFORMANCE
+              value: "1"
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /models
+          resources:
+            limits:
+              memory: 8Gi
+              cpu: "4"
+            requests:
+              memory: 2Gi
+              cpu: "1"
       containers:
         - name: vllm
           # Pin a real tag rather than latest once you've validated one.
@@ -56,7 +105,9 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
-            - "mattbucci/Qwen3.8-27B-AWQ"
+            # Served from the patched local copy, not straight from the Hub —
+            # see the init container above for why.
+            - "/models/qwen3.8-27b-awq"
             # llama-server --alias
             - "--served-model-name"
             - "unsloth/Qwen3.8-27B-GGUF:UD-Q4"
@@ -89,16 +140,24 @@ spec:
             - "--tool-call-parser"
             - "qwen3_coder"
             # REQUIRED for this checkpoint. Without it, vLLM tries to build AWQ
-            # weights for the vision tower's linear layers, whose input dims are
-            # not a multiple of the AWQ group size (128), and dies at load with:
+            # weights for the vision tower's linear layers, whose input dim (4304)
+            # is not a multiple of the AWQ group size (128), and dies at load with:
             #   ValueError: The input size is not aligned with the quantized
             #   weight shape. This can be caused by too large tensor parallel size.
             # (That TP hint is misleading — it fails identically at TP=1.)
-            # This flag skips the vision tower at load entirely. Text-only.
+            #
+            # NOTE: on vLLM 0.27.1.dev this flag alone does NOT stop the tower
+            # being constructed — qwen3_5.py builds self.visual regardless. The
+            # init container's config patch is what actually fixes the crash.
+            # Keep this anyway: it puts the engine in text-only mode.
             - "--language-model-only"
-            # llama-server --no-mmproj-offload. Belt and braces: the flag above is
-            # what actually prevents the tower being built. This only limits what
-            # requests may carry, and does NOT fix the load-time crash on its own.
+            # Worth trying INSTEAD of the config patch: the checkpoint's config.json
+            # carries a "language_model_only": false field, which the CLI flag above
+            # appears not to propagate into. Setting it directly may skip the tower.
+            # - "--hf-overrides"
+            # - '{"language_model_only": true}'
+            # llama-server --no-mmproj-offload. This only limits what requests may
+            # carry; it does NOT prevent the tower being built.
             - "--limit-mm-per-prompt"
             - '{"image": 0}'
             # llama-server --spec-type draft-mtp. Verify this checkpoint actually
