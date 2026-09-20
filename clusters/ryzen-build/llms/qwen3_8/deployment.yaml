@@ -1,248 +1,316 @@
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: qwen38-27b
-  namespace: qwen38
-  labels:
-    app: qwen38-27b
-spec:
-  type: ClusterIP
-  selector:
-    app: qwen38-27b
-  ports:
-    - name: http
-      port: 8080
-      targetPort: http
+# test deployment
 
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qwen38-27b
+  name: mistral-7b
   namespace: qwen38
   labels:
-    app: qwen38-27b
+    app: mistral-7b
 spec:
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
-      app: qwen38-27b
+      app: mistral-7b
   template:
     metadata:
       labels:
-        app: qwen38-27b
+        app: mistral-7b
     spec:
-      securityContext:
-        # ROCm needs access to the render node. Check the GID on the node:
-        #   getent group render video
-        supplementalGroups:
-          - 44    # video
-          - 991   # render  <-- verify this, it differs between distros
-        seccompProfile:
-          type: Unconfined
-      terminationGracePeriodSeconds: 60
-      initContainers:
-        # mattbucci/Qwen3.8-27B-AWQ ships "modules_to_not_convert": [] in its
-        # quantization_config, so vLLM tries to build AWQ weights for the vision
-        # tower too. The tower's intermediate_size is 4304, which is not a
-        # multiple of the AWQ group_size (128), so model init dies with:
-        #   ValueError: The input size is not aligned with the quantized weight shape.
-        # The checkpoint works in SGLang, which it was built on; vLLM needs the
-        # exclusion list to know those weights are stored unquantized.
-        # This fetches the repo once and patches that one field. Idempotent.
-        - name: fetch-and-patch
-          image: rocm/vllm:latest
-          command: ["python3", "-c"]
-          args:
-            - |
-              import json, os
-              from huggingface_hub import snapshot_download
-              target = "/models/qwen3.8-27b-awq"
-              path = snapshot_download(
-                  "mattbucci/Qwen3.8-27B-AWQ",
-                  local_dir=target,
-              )
-              cfg_path = os.path.join(path, "config.json")
-              with open(cfg_path) as f:
-                  cfg = json.load(f)
-              qc = cfg.get("quantization_config", {})
-              if "visual" not in qc.get("modules_to_not_convert") or []:
-                  qc["modules_to_not_convert"] = ["visual"]
-                  cfg["quantization_config"] = qc
-                  with open(cfg_path, "w") as f:
-                      json.dump(cfg, f, indent=2)
-                  print("patched modules_to_not_convert -> ['visual']")
-              else:
-                  print("already patched")
-          env:
-            - name: HF_HOME
-              value: /models
-            - name: HF_XET_HIGH_PERFORMANCE
-              value: "1"
-          volumeMounts:
-            - name: hf-cache
-              mountPath: /models
-          resources:
-            limits:
-              memory: 8Gi
-              cpu: "4"
-            requests:
-              memory: 2Gi
-              cpu: "1"
-      containers:
-        - name: vllm
-          # Pin a real tag rather than latest once you've validated one.
-          image: rocm/vllm:latest
-          imagePullPolicy: IfNotPresent
-          command: ["vllm", "serve"]
-          args:
-            # Served from the patched local copy, not straight from the Hub —
-            # see the init container above for why.
-            - "/models/qwen3.8-27b-awq"
-            # llama-server --alias
-            - "--served-model-name"
-            - "unsloth/Qwen3.8-27B-GGUF:UD-Q4"
-            - "--host"
-            - "0.0.0.0"
-            # llama-server --port 8080
-            - "--port"
-            - "8080"
-            # NOTE: your llama.cpp config used --cache-type-k/-v q4_0. vLLM has no
-            # 4-bit KV cache; its only quantized option is fp8, which measured
-            # SLOWER than bf16 on gfx1100 (no native FP8 -> software upcast).
-            # So KV is 16-bit here: ~4x the memory per token vs. your q4_0 setup,
-            # and correspondingly less context in the same 24 GiB.
-            - "--max-model-len"
-            - "24576"
-            # vLLM's memory profiling does not account for the gated-DeltaNet
-            # recurrent state or the vision tower. If it OOMs on startup, LOWER
-            # this rather than raising it.
-            - "--gpu-memory-utilization"
-            - "0.90"
-            # llama-server --parallel 1 / -np 1
-            - "--max-num-seqs"
-            - "1"
-            - "--cudagraph-capture-sizes"
-            - "1"
-            # llama-server --reasoning-format deepseek
-            - "--reasoning-parser"
-            - "qwen3"
-            - "--enable-auto-tool-choice"
-            - "--tool-call-parser"
-            - "qwen3_coder"
-            # REQUIRED for this checkpoint. Without it, vLLM tries to build AWQ
-            # weights for the vision tower's linear layers, whose input dim (4304)
-            # is not a multiple of the AWQ group size (128), and dies at load with:
-            #   ValueError: The input size is not aligned with the quantized
-            #   weight shape. This can be caused by too large tensor parallel size.
-            # (That TP hint is misleading — it fails identically at TP=1.)
-            #
-            # NOTE: on vLLM 0.27.1.dev this flag alone does NOT stop the tower
-            # being constructed — qwen3_5.py builds self.visual regardless. The
-            # init container's config patch is what actually fixes the crash.
-            # Keep this anyway: it puts the engine in text-only mode.
-            - "--language-model-only"
-            # Worth trying INSTEAD of the config patch: the checkpoint's config.json
-            # carries a "language_model_only": false field, which the CLI flag above
-            # appears not to propagate into. Setting it directly may skip the tower.
-            # - "--hf-overrides"
-            # - '{"language_model_only": true}'
-            # llama-server --no-mmproj-offload. This only limits what requests may
-            # carry; it does NOT prevent the tower being built.
-            - "--limit-mm-per-prompt"
-            - '{"image": 0}'
-            # llama-server --spec-type draft-mtp. Verify this checkpoint actually
-            # ships the MTP head before enabling — not every AWQ build keeps it,
-            # and the engine will fail to start if the tensors are absent.
-            # - "--speculative-config"
-            # - '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'
-            #
-            # No equivalent needed for: --jinja (chat template applied by default),
-            # -ngl -1 (always fully on GPU), --no-webui (no web UI exists).
-            #
-            # Leave --kv-cache-dtype unset. It defaults to auto, which on this
-            # checkpoint means bf16 — what you want. (Note: a compressed-tensors
-            # checkpoint carrying a kv_cache_scheme would be silently forced to
-            # fp8 here, which is ~2x slower per context-token on RDNA3 because
-            # gfx11 has no native FP8. AWQ checkpoints don't carry that field.)
-            #
-            # If AWQ kernels throw dtype errors on gfx1100, try --dtype float16.
-            # Default (bfloat16) is the better starting point for this model.
-          env:
-            - name: HF_HOME
-              value: /models
-            # HF_HUB_ENABLE_HF_TRANSFER is deprecated; this is its replacement.
-            - name: HF_XET_HIGH_PERFORMANCE
-              value: "1"
-            # Standard ROCm setup for this card.
-            - name: FLASH_ATTENTION_TRITON_AMD_ENABLE
-              value: "TRUE"
-            # gfx1100 is natively supported — do NOT set HSA_OVERRIDE_GFX_VERSION.
-            - name: VLLM_LOGGING_LEVEL
-              value: INFO
-            # - name: HUGGING_FACE_HUB_TOKEN
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: hf-token
-            #       key: token
-          ports:
-            - name: http
-              containerPort: 8080
-          resources:
-            limits:
-              amd.com/gpu: 1
-              memory: 48Gi
-              cpu: "8"
-            requests:
-              amd.com/gpu: 1
-              memory: 24Gi
-              cpu: "4"
-          volumeMounts:
-            - name: hf-cache
-              mountPath: /models
-            - name: shm
-              mountPath: /dev/shm
-            # Fallback only — the device plugin normally handles these:
-            # - name: kfd
-            #   mountPath: /dev/kfd
-            # - name: dri
-            #   mountPath: /dev/dri
-          # ~19 GB download plus AWQ load and CUDA-graph capture.
-          # 60 * 30s = 30 minutes before the pod is declared failed.
-          startupProbe:
-            httpGet:
-              path: /health
-              port: http
-            periodSeconds: 30
-            failureThreshold: 60
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: http
-            periodSeconds: 10
-            failureThreshold: 3
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            periodSeconds: 30
-            failureThreshold: 5
       volumes:
-        - name: hf-cache
-          persistentVolumeClaim:
-            claimName: hf-cache
+      # PVC
+      - name: cache-volume
+        persistentVolumeClaim:
+          claimName: mistral-7b
+      # vLLM needs to access the host's shared memory for tensor parallel inference.
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "8Gi"
+      hostNetwork: true
+      hostIPC: true
+      containers:
+      - name: mistral-7b
+        image: rocm/vllm:rocm6.2_mi300_ubuntu20.04_py3.9_vllm_0.6.4
+        securityContext:
+          seccompProfile:
+            type: Unconfined
+          runAsGroup: 44
+          capabilities:
+            add:
+            - SYS_PTRACE
+        command: ["/bin/sh", "-c"]
+        args: [
+          "vllm serve mistralai/Mistral-7B-v0.3 --port 8000 --trust-remote-code --enable-chunked-prefill --max-num-batched-tokens 1024"
+        ]
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            cpu: "10"
+            memory: 20G
+            amd.com/gpu: "1"
+          requests:
+            cpu: "6"
+            memory: 6G
+            amd.com/gpu: "1"
+        volumeMounts:
+        - name: cache-volume
+          mountPath: /root/.cache/huggingface
         - name: shm
-          emptyDir:
-            medium: Memory
-            sizeLimit: 8Gi
-        # - name: kfd
-        #   hostPath:
-        #     path: /dev/kfd
-        #     type: CharDevice
-        # - name: dri
-        #   hostPath:
-        #     path: /dev/dri
-        #     type: Directory
+          mountPath: /dev/shm
+
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: qwen38-27b
+#   namespace: qwen38
+#   labels:
+#     app: qwen38-27b
+# spec:
+#   type: ClusterIP
+#   selector:
+#     app: qwen38-27b
+#   ports:
+#     - name: http
+#       port: 8080
+#       targetPort: http
+
+# ---
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: qwen38-27b
+#   namespace: qwen38
+#   labels:
+#     app: qwen38-27b
+# spec:
+#   replicas: 1
+#   strategy:
+#     type: Recreate
+#   selector:
+#     matchLabels:
+#       app: qwen38-27b
+#   template:
+#     metadata:
+#       labels:
+#         app: qwen38-27b
+#     spec:
+#       securityContext:
+#         # ROCm needs access to the render node. Check the GID on the node:
+#         #   getent group render video
+#         supplementalGroups:
+#           - 44    # video
+#           - 991   # render  <-- verify this, it differs between distros
+#         seccompProfile:
+#           type: Unconfined
+#       terminationGracePeriodSeconds: 60
+#       initContainers:
+#         # mattbucci/Qwen3.8-27B-AWQ ships "modules_to_not_convert": [] in its
+#         # quantization_config, so vLLM tries to build AWQ weights for the vision
+#         # tower too. The tower's intermediate_size is 4304, which is not a
+#         # multiple of the AWQ group_size (128), so model init dies with:
+#         #   ValueError: The input size is not aligned with the quantized weight shape.
+#         # The checkpoint works in SGLang, which it was built on; vLLM needs the
+#         # exclusion list to know those weights are stored unquantized.
+#         # This fetches the repo once and patches that one field. Idempotent.
+#         - name: fetch-and-patch
+#           image: rocm/vllm:latest
+#           command: ["python3", "-c"]
+#           args:
+#             - |
+#               import json, os
+#               from huggingface_hub import snapshot_download
+#               target = "/models/qwen3.8-27b-awq"
+#               path = snapshot_download(
+#                   "mattbucci/Qwen3.8-27B-AWQ",
+#                   local_dir=target,
+#               )
+#               cfg_path = os.path.join(path, "config.json")
+#               with open(cfg_path) as f:
+#                   cfg = json.load(f)
+#               qc = cfg.get("quantization_config", {})
+#               if "visual" not in qc.get("modules_to_not_convert") or []:
+#                   qc["modules_to_not_convert"] = ["visual"]
+#                   cfg["quantization_config"] = qc
+#                   with open(cfg_path, "w") as f:
+#                       json.dump(cfg, f, indent=2)
+#                   print("patched modules_to_not_convert -> ['visual']")
+#               else:
+#                   print("already patched")
+#           env:
+#             - name: HF_HOME
+#               value: /models
+#             - name: HF_XET_HIGH_PERFORMANCE
+#               value: "1"
+#           volumeMounts:
+#             - name: hf-cache
+#               mountPath: /models
+#           resources:
+#             limits:
+#               memory: 8Gi
+#               cpu: "4"
+#             requests:
+#               memory: 2Gi
+#               cpu: "1"
+#       containers:
+#         - name: vllm
+#           # Pin a real tag rather than latest once you've validated one.
+#           image: rocm/vllm:latest
+#           imagePullPolicy: IfNotPresent
+#           command: ["vllm", "serve"]
+#           args:
+#             # Served from the patched local copy, not straight from the Hub —
+#             # see the init container above for why.
+#             - "/models/qwen3.8-27b-awq"
+#             # llama-server --alias
+#             - "--served-model-name"
+#             - "unsloth/Qwen3.8-27B-GGUF:UD-Q4"
+#             - "--host"
+#             - "0.0.0.0"
+#             # llama-server --port 8080
+#             - "--port"
+#             - "8080"
+#             # NOTE: your llama.cpp config used --cache-type-k/-v q4_0. vLLM has no
+#             # 4-bit KV cache; its only quantized option is fp8, which measured
+#             # SLOWER than bf16 on gfx1100 (no native FP8 -> software upcast).
+#             # So KV is 16-bit here: ~4x the memory per token vs. your q4_0 setup,
+#             # and correspondingly less context in the same 24 GiB.
+#             - "--max-model-len"
+#             - "24576"
+#             # vLLM's memory profiling does not account for the gated-DeltaNet
+#             # recurrent state or the vision tower. If it OOMs on startup, LOWER
+#             # this rather than raising it.
+#             - "--gpu-memory-utilization"
+#             - "0.90"
+#             # llama-server --parallel 1 / -np 1
+#             - "--max-num-seqs"
+#             - "1"
+#             - "--cudagraph-capture-sizes"
+#             - "1"
+#             # llama-server --reasoning-format deepseek
+#             - "--reasoning-parser"
+#             - "qwen3"
+#             - "--enable-auto-tool-choice"
+#             - "--tool-call-parser"
+#             - "qwen3_coder"
+#             # REQUIRED for this checkpoint. Without it, vLLM tries to build AWQ
+#             # weights for the vision tower's linear layers, whose input dim (4304)
+#             # is not a multiple of the AWQ group size (128), and dies at load with:
+#             #   ValueError: The input size is not aligned with the quantized
+#             #   weight shape. This can be caused by too large tensor parallel size.
+#             # (That TP hint is misleading — it fails identically at TP=1.)
+#             #
+#             # NOTE: on vLLM 0.27.1.dev this flag alone does NOT stop the tower
+#             # being constructed — qwen3_5.py builds self.visual regardless. The
+#             # init container's config patch is what actually fixes the crash.
+#             # Keep this anyway: it puts the engine in text-only mode.
+#             - "--language-model-only"
+#             # Worth trying INSTEAD of the config patch: the checkpoint's config.json
+#             # carries a "language_model_only": false field, which the CLI flag above
+#             # appears not to propagate into. Setting it directly may skip the tower.
+#             # - "--hf-overrides"
+#             # - '{"language_model_only": true}'
+#             # llama-server --no-mmproj-offload. This only limits what requests may
+#             # carry; it does NOT prevent the tower being built.
+#             - "--limit-mm-per-prompt"
+#             - '{"image": 0}'
+#             # llama-server --spec-type draft-mtp. Verify this checkpoint actually
+#             # ships the MTP head before enabling — not every AWQ build keeps it,
+#             # and the engine will fail to start if the tensors are absent.
+#             # - "--speculative-config"
+#             # - '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'
+#             #
+#             # No equivalent needed for: --jinja (chat template applied by default),
+#             # -ngl -1 (always fully on GPU), --no-webui (no web UI exists).
+#             #
+#             # Leave --kv-cache-dtype unset. It defaults to auto, which on this
+#             # checkpoint means bf16 — what you want. (Note: a compressed-tensors
+#             # checkpoint carrying a kv_cache_scheme would be silently forced to
+#             # fp8 here, which is ~2x slower per context-token on RDNA3 because
+#             # gfx11 has no native FP8. AWQ checkpoints don't carry that field.)
+#             #
+#             # If AWQ kernels throw dtype errors on gfx1100, try --dtype float16.
+#             # Default (bfloat16) is the better starting point for this model.
+#           env:
+#             - name: HF_HOME
+#               value: /models
+#             # HF_HUB_ENABLE_HF_TRANSFER is deprecated; this is its replacement.
+#             - name: HF_XET_HIGH_PERFORMANCE
+#               value: "1"
+#             # Standard ROCm setup for this card.
+#             - name: FLASH_ATTENTION_TRITON_AMD_ENABLE
+#               value: "TRUE"
+#             # gfx1100 is natively supported — do NOT set HSA_OVERRIDE_GFX_VERSION.
+#             - name: VLLM_LOGGING_LEVEL
+#               value: INFO
+#             # - name: HUGGING_FACE_HUB_TOKEN
+#             #   valueFrom:
+#             #     secretKeyRef:
+#             #       name: hf-token
+#             #       key: token
+#           ports:
+#             - name: http
+#               containerPort: 8080
+#           resources:
+#             limits:
+#               amd.com/gpu: 1
+#               memory: 48Gi
+#               cpu: "8"
+#             requests:
+#               amd.com/gpu: 1
+#               memory: 24Gi
+#               cpu: "4"
+#           volumeMounts:
+#             - name: hf-cache
+#               mountPath: /models
+#             - name: shm
+#               mountPath: /dev/shm
+#             # Fallback only — the device plugin normally handles these:
+#             # - name: kfd
+#             #   mountPath: /dev/kfd
+#             # - name: dri
+#             #   mountPath: /dev/dri
+#           # ~19 GB download plus AWQ load and CUDA-graph capture.
+#           # 60 * 30s = 30 minutes before the pod is declared failed.
+#           startupProbe:
+#             httpGet:
+#               path: /health
+#               port: http
+#             periodSeconds: 30
+#             failureThreshold: 60
+#           readinessProbe:
+#             httpGet:
+#               path: /health
+#               port: http
+#             periodSeconds: 10
+#             failureThreshold: 3
+#           livenessProbe:
+#             httpGet:
+#               path: /health
+#               port: http
+#             periodSeconds: 30
+#             failureThreshold: 5
+#       volumes:
+#         - name: hf-cache
+#           persistentVolumeClaim:
+#             claimName: hf-cache
+#         - name: shm
+#           emptyDir:
+#             medium: Memory
+#             sizeLimit: 8Gi
+#         # - name: kfd
+#         #   hostPath:
+#         #     path: /dev/kfd
+#         #     type: CharDevice
+#         # - name: dri
+#         #   hostPath:
+#         #     path: /dev/dri
+#         #     type: Directory
