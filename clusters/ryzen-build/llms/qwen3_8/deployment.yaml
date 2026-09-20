@@ -66,8 +66,8 @@ spec:
             - "0.90"
             - "--max-num-seqs"
             - "32"
-            - "--cudagraph-capture-sizes"
-            - "1,2,4,8,16,32"
+            # - "--cudagraph-capture-sizes"
+            # - "1,2,4,8,16,32"
             # Qwen3.8 thinking + tool calling
             - "--reasoning-parser"
             - "qwen3"
