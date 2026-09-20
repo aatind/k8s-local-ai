@@ -1,178 +1,117 @@
 ---
-# vLLM on ROCm serving mattbucci/Qwen3.8-27B-AWQ (W4A16, ~18.7 GB weights)
+# vLLM on ROCm serving Devstral Small 2 24B (agentic coding, Apache 2.0)
 # Target: single AMD Radeon RX 7900 XTX (gfx1100, RDNA3, 24 GiB)
 #
 # Expects to already exist in namespace qwen38:
 #   - a PVC named hf-cache (>= 40Gi)
-#   - a Service targeting app=qwen38-27b on port 8080
+#   - a Service targeting the pod labels below on port 8080
+#     NOTE: the labels changed from app=qwen38-27b to app=devstral.
+#     Update your Service selector or the Service will match nothing.
 #
-# No custom image required: AWQ is one of the quantization methods that works
-# on ROCm, so the stock rocm/vllm image serves this checkpoint directly.
+# Why this model on this card: Devstral Small 2 is a dense transformer based on
+# Mistral-Small-3.1 (40 layers, grouped-query attention). No gated DeltaNet, no
+# mamba state, no hybrid KV manager — none of the machinery that made
+# Qwen3.8-27B painful on RDNA3. At ~16 GiB it also leaves real KV headroom
+# instead of the ~24k ceiling the 27B forced.
 #
-# Reality check for this card, from a gfx1100 report on this exact model:
-#   ~29 tok/s decode at 2k context with 8 concurrent sequences,
-#   ~24,576 tokens of KV cache available with bf16 KV.
-# Do not plan for the model's native 262k context on one 24 GiB card.
+# NOTE: mistralai/Devstral-Small-2-24B-Instruct-2512 ships FP8 weights, which
+# need MI300+ on the AMD side. gfx1100 has no native FP8, so a 4-bit build is
+# required — that's what this manifest uses.
 
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: qwen38-27b
+  name: devstral
   namespace: qwen38
   labels:
-    app: qwen38-27b
+    app: devstral
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: qwen38-27b
+      app: devstral
   template:
     metadata:
       labels:
-        app: qwen38-27b
+        app: devstral
     spec:
-      # Requires the AMD GPU device plugin on the node. It injects /dev/kfd and
-      # /dev/dri; the hostPath mounts below are only a fallback without it.
       nodeSelector:
         amd.com/gpu.device-id: "744c"     # Navi 31 / 7900 XTX. Drop this if your
                                           # nodes aren't labelled — the amd.com/gpu
-                                          # resource request places the pod anyway.
+                                          # request places the pod anyway.
       securityContext:
-        # ROCm needs access to the render node. Check the GIDs on the node:
-        #   getent group render video
         supplementalGroups:
           - 44    # video
-          - 991   # render  <-- from your Mistral manifest; verify per node
+          - 991   # render
         seccompProfile:
           type: Unconfined
       terminationGracePeriodSeconds: 60
-      initContainers:
-        # mattbucci/Qwen3.8-27B-AWQ ships "modules_to_not_convert": [] in its
-        # quantization_config, so vLLM tries to build AWQ weights for the vision
-        # tower too. The tower's intermediate_size is 4304, which is not a
-        # multiple of the AWQ group_size (128), so model init dies with:
-        #   ValueError: The input size is not aligned with the quantized weight shape.
-        # The checkpoint works in SGLang, which it was built on; vLLM needs the
-        # exclusion list to know those weights are stored unquantized.
-        # This fetches the repo once and patches that one field. Idempotent.
-        - name: fetch-and-patch
-          image: rocm/vllm:latest
-          command: ["python3", "-c"]
-          args:
-            - |
-              import json, os
-              from huggingface_hub import snapshot_download
-              path = snapshot_download(
-                  "mattbucci/Qwen3.8-27B-AWQ",
-                  local_dir="/models/qwen3.8-27b-awq",
-              )
-              cfg_path = os.path.join(path, "config.json")
-              with open(cfg_path) as f:
-                  cfg = json.load(f)
-              qc = cfg.get("quantization_config", {})
-              if "visual" not in (qc.get("modules_to_not_convert") or []):
-                  qc["modules_to_not_convert"] = ["visual"]
-                  cfg["quantization_config"] = qc
-                  with open(cfg_path, "w") as f:
-                      json.dump(cfg, f, indent=2)
-                  print("patched modules_to_not_convert -> ['visual']")
-              else:
-                  print("already patched")
-          env:
-            - name: HF_HOME
-              value: /models
-            - name: HF_XET_HIGH_PERFORMANCE
-              value: "1"
-          volumeMounts:
-            - name: hf-cache
-              mountPath: /models
-          resources:
-            limits:
-              memory: 8Gi
-              cpu: "4"
-            requests:
-              memory: 2Gi
-              cpu: "1"
       containers:
         - name: vllm
-          # Pin a real tag rather than latest once you've validated one.
           # Must NOT be an mi300-tagged image: those carry gfx942 kernels only
           # and fail on gfx1100 with "HIP error: invalid device function".
           image: rocm/vllm:latest
           imagePullPolicy: IfNotPresent
           command: ["vllm", "serve"]
           args:
-            # Served from the patched local copy, not straight from the Hub —
-            # see the init container above for why.
-            - "/models/qwen3.8-27b-awq"
-            # llama-server --alias
+            # ~16 GiB AWQ 4-bit build of Devstral-Small-2-24B-Instruct-2512.
+            # Alternative if this misbehaves — a mixed INT4/INT8 GPTQ build made
+            # specifically for GPUs without native FP8, and tagged for ROCm:
+            #   btbtyler09/Devstral-Small-2-24B-Instruct-INT4-INT8-Mixed-GPTQ
+            # It trades some size and speed for accuracy, so expect less KV room.
+            - "cyankiwi/Devstral-Small-2-24B-Instruct-2512-AWQ-4bit"
             - "--served-model-name"
-            - "unsloth/Qwen3.8-27B-GGUF:UD-Q4"
+            - "devstral"
             - "--host"
             - "0.0.0.0"
-            # llama-server --port 8080
             - "--port"
             - "8080"
-            # NOTE: your llama.cpp config used --cache-type-k/-v q4_0. vLLM has no
-            # 4-bit KV cache; its only quantized option is fp8, which measured
-            # SLOWER than bf16 on gfx1100 (no native FP8 -> software upcast).
-            # So KV is 16-bit here: ~4x the memory per token vs. your q4_0 setup,
-            # and correspondingly less context in the same 24 GiB.
+            # 24B at 4-bit is ~16 GiB, leaving ~5-6 GiB for KV at util 0.90.
+            # Mistral-Small-3.1 geometry (40 layers, 8 KV heads, head_dim 128)
+            # costs ~160 KB/token at bf16, so ~32k is the realistic starting
+            # point. Read the "GPU KV cache size" line at startup and adjust.
             - "--max-model-len"
-            - "24576"
-            # vLLM's memory profiling does not account for the gated-DeltaNet
-            # recurrent state or the vision tower. If it OOMs on startup, LOWER
-            # this rather than raising it.
+            - "32768"
             - "--gpu-memory-utilization"
             - "0.90"
-            # llama-server --parallel 1 / -np 1
+            # Single-user agent workload, matching your llama-server --parallel 1.
+            # Raise both together if you want dsh running concurrent tool calls.
             - "--max-num-seqs"
             - "1"
             - "--cudagraph-capture-sizes"
             - "1"
-            # llama-server --reasoning-format deepseek
-            - "--reasoning-parser"
-            - "qwen3"
-            - "--enable-auto-tool-choice"
+            # Mistral's own recommendation for this model. NOT qwen3_coder —
+            # the wrong parser is a silent failure: the model emits valid calls
+            # and vLLM fails to parse them, so dsh just sees prose.
             - "--tool-call-parser"
-            - "qwen3_coder"
-            # NOTE: on vLLM 0.27.1.dev this flag does NOT stop the vision tower
-            # being constructed — qwen3_5.py builds self.visual regardless. The
-            # init container's config patch is what fixes the load crash.
-            # Keep this anyway: it puts the engine in text-only mode.
-            - "--language-model-only"
-            # Worth trying INSTEAD of the config patch: the checkpoint's config.json
-            # carries a "language_model_only": false field, which the CLI flag above
-            # appears not to propagate into. Setting it directly may skip the tower.
-            # - "--hf-overrides"
-            # - '{"language_model_only": true}'
-            # llama-server --no-mmproj-offload. This only limits what requests may
-            # carry; it does NOT prevent the tower being built.
+            - "mistral"
+            - "--enable-auto-tool-choice"
+            # The 2512 build kept the Mistral-Small-3.1 vision encoder. You are
+            # not using images from a coding harness, and disabling it reclaims
+            # the tower's VRAM.
             - "--limit-mm-per-prompt"
             - '{"image": 0}'
-            # llama-server --spec-type draft-mtp. Verify this checkpoint actually
-            # ships the MTP head before enabling — not every AWQ build keeps it,
-            # and the engine will fail to start if the tensors are absent.
-            # - "--speculative-config"
-            # - '{"method":"qwen3_5_mtp","num_speculative_tokens":1}'
+            # If the engine trips over Mistral-format config detection (it reads
+            # params.json rather than config.json), force the HF path:
+            # - "--config-format"
+            # - "hf"
             #
-            # No equivalent needed for: --jinja (chat template applied by default),
-            # -ngl -1 (always fully on GPU), --no-webui (no web UI exists).
+            # No --reasoning-parser here: Devstral is not a thinking-mode model,
+            # so the qwen3 parser from the previous manifest does not apply.
             #
-            # Leave --kv-cache-dtype unset. It defaults to auto, which on this
-            # checkpoint means bf16 — what you want. (Note: a compressed-tensors
-            # checkpoint carrying a kv_cache_scheme would be silently forced to
-            # fp8 here, which is ~2x slower per context-token on RDNA3 because
-            # gfx11 has no native FP8. AWQ checkpoints don't carry that field.)
+            # Leave --kv-cache-dtype unset (defaults to bf16 here). If you see
+            # fp8 reaching the attention op, that's a compressed-tensors
+            # checkpoint carrying a kv_cache_scheme — on RDNA3 that measured
+            # ~2x slower per context-token than bf16.
             #
-            # If AWQ kernels throw dtype errors on gfx1100, try --dtype float16.
-            # Default (bfloat16) is the better starting point for this model.
+            # Mistral recommends temperature 0.15 for this model. Set that in
+            # dsh, not here. The repo also ships CHAT_SYSTEM_PROMPT.txt, which
+            # is worth feeding to the harness as the system prompt.
           env:
             - name: HF_HOME
               value: /models
-            # HF_HUB_ENABLE_HF_TRANSFER is deprecated; this is its replacement.
             - name: HF_XET_HIGH_PERFORMANCE
               value: "1"
             # Standard ROCm setup for this card.
@@ -203,13 +142,7 @@ spec:
               mountPath: /models
             - name: shm
               mountPath: /dev/shm
-            # Fallback only — the device plugin normally handles these:
-            # - name: kfd
-            #   mountPath: /dev/kfd
-            # - name: dri
-            #   mountPath: /dev/dri
-          # ~19 GB download plus AWQ load and CUDA-graph capture.
-          # 60 * 30s = 30 minutes before the pod is declared failed.
+          # ~16 GiB download plus load and graph capture on first start.
           startupProbe:
             httpGet:
               path: /health
@@ -236,11 +169,3 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 8Gi
-        # - name: kfd
-        #   hostPath:
-        #     path: /dev/kfd
-        #     type: CharDevice
-        # - name: dri
-        #   hostPath:
-        #     path: /dev/dri
-        #     type: Directory
