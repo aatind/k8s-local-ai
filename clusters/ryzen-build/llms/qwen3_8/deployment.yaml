@@ -38,7 +38,7 @@ spec:
       hostIPC: true
       containers:
       - name: mistral-7b
-        image: rocm/vllm:rocm6.2_mi300_ubuntu20.04_py3.9_vllm_0.6.4
+        image: rocm/vllm:latest
         securityContext:
           seccompProfile:
             type: Unconfined
