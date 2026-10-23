@@ -16,3 +16,9 @@ data:
       base_url: http://qwen3-8-27b.qwen38.svc:8000/v1
       # Matches llama-server's --ctx-size
       context_length: 131072
+    web:
+      # apps/searxng, reached through SEARXNG_URL (set in the Deployment)
+      search_backend: searxng
+      # SearXNG can't fetch pages. Left unset, extract would autodetect
+      # SearXNG too and fail, so pin Keenable's keyless free tier.
+      extract_backend: keenable
