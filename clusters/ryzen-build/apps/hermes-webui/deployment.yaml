@@ -10,8 +10,10 @@
 #
 # Nothing is written to emptyDirs: kubelet keeps those on the node's small
 # root filesystem (44 GiB, shared with the OS), while local-path volumes and
-# images are on /home (k3s data dir). The venv, staged agent source and /tmp
-# are subPaths of the data volume instead, wiped and rebuilt on each start.
+# images are on /home (k3s data dir). The venv and staged agent source are
+# subPaths of the data volume instead, wiped and rebuilt on each start; /tmp
+# and the user's home (tools the agent installs in ~/bin, ~/.kube, ...) are
+# subPaths too, and persist.
 #
 # Rootless: with runAsUser set, the image's init script skips its root-only
 # UID remapping and checks it already runs as WANTED_UID/WANTED_GID (1024,
@@ -167,6 +169,9 @@ spec:
               value: "1024"
             - name: WANTED_GID
               value: "1024"
+            # The image's PATH, plus where the agent installs its own tools
+            - name: PATH
+              value: /home/hermeswebui/bin:/home/hermeswebui/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: HERMES_WEBUI_STATE_DIR
               value: /home/hermeswebui/.hermes/webui
             - name: UV_CACHE_DIR
@@ -241,6 +246,10 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 5
           volumeMounts:
+            # Before the mounts nested under it
+            - name: data
+              mountPath: /home/hermeswebui
+              subPath: home
             - name: data
               mountPath: /home/hermeswebui/.hermes
               subPath: hermes
