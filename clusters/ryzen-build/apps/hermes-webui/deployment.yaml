@@ -178,6 +178,27 @@ spec:
                 secretKeyRef:
                   name: hermes-webui
                   key: HERMES_WEBUI_PASSWORD
+            # Optional GitHub token for the agent's git and GitHub tools, from
+            # the same hand-made Secret. git reads it through a credential
+            # helper set here, so it is never written to disk.
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-webui
+                  key: GITHUB_TOKEN
+                  optional: true
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-webui
+                  key: GITHUB_TOKEN
+                  optional: true
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: credential.https://github.com.helper
+            - name: GIT_CONFIG_VALUE_0
+              value: '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GITHUB_TOKEN"; }; f'
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
