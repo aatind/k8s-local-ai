@@ -1,0 +1,240 @@
+---
+# Hermes WebUI (https://github.com/nesquena/hermes-webui) with Hermes Agent
+# running in-process, using the local qwen3.8-27b as its model.
+#
+# The WebUI image doesn't ship the agent: at startup it installs the agent's
+# Python package from source found at ~/.hermes/hermes-agent. The first init
+# container copies that source out of the pinned agent image, so the two stay
+# in step when either tag is bumped. Dependencies are re-installed into /app
+# on every start; uv's cache on the volume keeps that quick after the first.
+#
+# Nothing is written to emptyDirs: kubelet keeps those on the node's small
+# root filesystem (44 GiB, shared with the OS), while local-path volumes and
+# images are on /home (k3s data dir). The venv, staged agent source and /tmp
+# are subPaths of the data volume instead, wiped and rebuilt on each start.
+#
+# Rootless: with runAsUser set, the image's init script skips its root-only
+# UID remapping and checks it already runs as WANTED_UID/WANTED_GID (1024,
+# the image's hermeswebui user).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-webui
+  namespace: hermes
+  labels:
+    app: hermes-webui
+spec:
+  replicas: 1
+  # ReadWriteOnce volume and a SQLite state db: never two pods at once
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hermes-webui
+  template:
+    metadata:
+      labels:
+        app: hermes-webui
+    spec:
+      # Service "hermes-webui" would inject HERMES_WEBUI_PORT=tcp://..., which
+      # the WebUI reads as its listen port
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1024
+        runAsGroup: 1024
+        fsGroup: 1024
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Agent source only; the image's venv and uv cache stay behind.
+        - name: agent-src
+          image: nousresearch/hermes-agent:v0.22.5
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # Into a subdir we own: tar can't chmod the volume root itself
+              rm -rf /agent/src
+              mkdir /agent/src
+              tar -C /opt/hermes \
+                --exclude=./.venv --exclude=./uv-cache \
+                --exclude=./pm-runtime --exclude=./node_modules --exclude=./.git \
+                --exclude=./tools/.install.lock \
+                -cf - . | tar -C /agent/src -xf -
+              test -f /agent/src/pyproject.toml
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: data
+              mountPath: /agent
+              subPath: agent-src
+        # Fills /app from the image (the WebUI's own copy step uses cp -a, which
+        # can't chmod a mount's root as non-root), builds the venv, and
+        # seeds config.yaml. The WebUI's script would resolve hermes-agent[all]
+        # from pyproject.toml, which fails for agent v0.22.5 (browser-harness
+        # pins another pillow than the agent; only uv.lock has the override),
+        # so the venv is built here and the script finds .deps_installed.
+        - name: prepare
+          image: ghcr.io/nesquena/hermes-webui:0.52.492
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              find /app -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+              cp -R /apptoo/. /app/
+              cp -R /agent/. /app/hermes-agent-src/
+              cd /app
+              uv venv --clear venv
+              . venv/bin/activate
+              uv pip install -r requirements.txt
+              # The agent's uv.lock carries its dependency overrides (pillow);
+              # a plain resolve of pyproject.toml conflicts, so install the
+              # locked set as-is.
+              (cd /app/hermes-agent-src && uv export --frozen --no-dev \
+                --no-emit-project --no-hashes -o /tmp/agent-requirements.txt)
+              uv pip install --no-deps -r /tmp/agent-requirements.txt
+              uv pip install --no-deps -e /app/hermes-agent-src
+              python -c 'import run_agent'
+              touch venv/.deps_installed
+              if [ -f /hermes/config.yaml ]; then
+                echo "config.yaml present, leaving it alone"
+              else
+                cp /seed/config.yaml /hermes/config.yaml
+                echo "seeded config.yaml"
+              fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: UV_CACHE_DIR
+              value: /uv_cache
+            - name: UV_PYTHON
+              value: "3.14"
+            - name: UV_PYTHON_INSTALL_DIR
+              value: /uv_cache/python
+            - name: UV_LINK_MODE
+              value: copy
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /app
+              subPath: app
+            - name: data
+              mountPath: /agent
+              subPath: agent-src/src
+              readOnly: true
+            - name: data
+              mountPath: /uv_cache
+              subPath: uv-cache
+            - name: data
+              mountPath: /tmp
+              subPath: tmp
+            - name: data
+              mountPath: /hermes
+              subPath: hermes
+            - name: config-seed
+              mountPath: /seed
+      containers:
+        - name: hermes-webui
+          image: ghcr.io/nesquena/hermes-webui:0.52.492
+          env:
+            - name: WANTED_UID
+              value: "1024"
+            - name: WANTED_GID
+              value: "1024"
+            - name: HERMES_WEBUI_STATE_DIR
+              value: /home/hermeswebui/.hermes/webui
+            - name: UV_CACHE_DIR
+              value: /uv_cache
+            # Agent v0.22 declares its core dependencies only for Python
+            # >= 3.14; this image's init script builds the venv with plain
+            # "uv venv", which would pick the image's 3.12. uv downloads 3.14.
+            - name: UV_PYTHON
+              value: "3.14"
+            - name: UV_PYTHON_INSTALL_DIR
+              value: /uv_cache/python
+            - name: HERMES_WEBUI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hermes-webui
+                  key: HERMES_WEBUI_PASSWORD
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8787
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 4Gi
+          # First start installs the agent's dependencies from PyPI
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          volumeMounts:
+            - name: data
+              mountPath: /home/hermeswebui/.hermes
+              subPath: hermes
+            - name: data
+              mountPath: /home/hermeswebui/.hermes/hermes-agent
+              subPath: agent-src/src
+              readOnly: true
+            - name: data
+              mountPath: /workspace
+              subPath: workspace
+            - name: data
+              mountPath: /uv_cache
+              subPath: uv-cache
+            - name: data
+              mountPath: /app
+              subPath: app
+            - name: data
+              mountPath: /tmp
+              subPath: tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hermes-webui-data
+        - name: config-seed
+          configMap:
+            name: hermes-config-seed

@@ -1,0 +1,13 @@
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hermes
+# The login password (Secret hermes-webui) is created by hand, not from git:
+#   kubectl -n hermes create secret generic hermes-webui \
+#     --from-literal=HERMES_WEBUI_PASSWORD="$(openssl rand -base64 24)"
+resources:
+- namespace.yaml
+- pvc.yaml
+- configmap.yaml
+- deployment.yaml
+- service.yaml

@@ -1,0 +1,18 @@
+---
+# Starting config.yaml for Hermes. The init container copies it into the
+# Hermes home only if none exists, so settings saved from the WebUI stick.
+# To re-apply this file, delete config.yaml on the volume and restart the pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-config-seed
+  namespace: hermes
+data:
+  config.yaml: |
+    model:
+      # The local llama.cpp server (llms/qwen3_8); it runs without an API key
+      default: qwen3.8-27b
+      provider: custom
+      base_url: http://qwen3-8-27b.qwen38.svc:8000/v1
+      # Matches llama-server's --ctx-size
+      context_length: 131072

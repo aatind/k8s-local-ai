@@ -1,0 +1,19 @@
+---
+# LAN: http://<node-ip>:30878 (fixed NodePort, any node's IP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes-webui
+  namespace: hermes
+  labels:
+    app: hermes-webui
+spec:
+  type: NodePort
+  selector:
+    app: hermes-webui
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http
+      nodePort: 30878
+      protocol: TCP

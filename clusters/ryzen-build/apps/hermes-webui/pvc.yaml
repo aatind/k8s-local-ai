@@ -1,0 +1,15 @@
+---
+# Hermes home (config, sessions, skills, memories, WebUI state), the agent's
+# /workspace and uv's package cache, as subPaths of one volume.
+# local-path: lives on the node's NVMe.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-webui-data
+  namespace: hermes
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
