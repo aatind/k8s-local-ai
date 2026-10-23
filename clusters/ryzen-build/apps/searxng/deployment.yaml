@@ -14,6 +14,9 @@ metadata:
   namespace: searxng
   labels:
     app: searxng
+  annotations:
+    # Restart on settings changes (apps/reloader)
+    configmap.reloader.stakater.com/reload: searxng-settings
 spec:
   replicas: 1
   selector:

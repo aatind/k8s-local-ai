@@ -1,0 +1,34 @@
+---
+# Reloader (https://github.com/stakater/Reloader): rolls a workload when a
+# ConfigMap or Secret it names in an annotation changes. Opt-in per
+# workload, e.g. on a Deployment's metadata:
+#   configmap.reloader.stakater.com/reload: "<name>[,<name>...]"
+#   secret.reloader.stakater.com/reload: "<name>[,<name>...]"
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: reloader
+  namespace: reloader
+spec:
+  interval: 1h
+  chart:
+    spec:
+      chart: reloader
+      # Reloader v1.4.22; 3.x is still in beta
+      version: 2.2.18
+      sourceRef:
+        kind: HelmRepository
+        name: stakater
+  values:
+    reloader:
+      # Roll pods by bumping a pod-template annotation instead of injecting
+      # an env var, so the change doesn't touch fields Flux applies from git
+      reloadStrategy: annotations
+      readOnlyRootFileSystem: true
+      deployment:
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
