@@ -23,6 +23,11 @@ metadata:
   namespace: hermes
   labels:
     app: hermes-webui
+  annotations:
+    # Restart on password or GitHub token changes (apps/reloader). Not the
+    # hermes-config-seed ConfigMap: it is only copied in when config.yaml is
+    # missing, so a restart wouldn't apply it.
+    secret.reloader.stakater.com/reload: hermes-webui
 spec:
   replicas: 1
   # ReadWriteOnce volume and a SQLite state db: never two pods at once
