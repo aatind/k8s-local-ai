@@ -69,6 +69,14 @@ spec:
                 --exclude=./tools/.install.lock \
                 -cf - . | tar -C /agent/src -xf -
               test -f /agent/src/pyproject.toml
+              # Agent v0.22.5 renamed _sort_skills to sort_skills; WebUI
+              # 0.52.492 still imports the old name, so the Skills panel
+              # 500s (hermes-webui #8406, fixed after that release). Drop
+              # this once the WebUI tag is bumped past the fix.
+              f=/agent/src/tools/skills_tool.py
+              if ! grep -q '^_sort_skills' "$f"; then
+                printf '\n_sort_skills = sort_skills\n' >> "$f"
+              fi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
