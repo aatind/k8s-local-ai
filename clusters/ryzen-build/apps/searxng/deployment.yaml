@@ -1,0 +1,86 @@
+---
+# SearXNG (https://github.com/searxng/searxng), the metasearch backend for
+# Hermes' web_search tool.
+#
+# Stateless: settings come from the ConfigMap, the favicon cache lives in the
+# container's writable layer (on /home with the images, not the root fs).
+#
+# Rootless as the image's searxng user (977), which already owns
+# /etc/searxng and /var/cache/searxng, so the entrypoint's chown is skipped.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+  namespace: searxng
+  labels:
+    app: searxng
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: searxng
+  template:
+    metadata:
+      labels:
+        app: searxng
+    spec:
+      # Service "searxng" would inject SEARXNG_PORT=tcp://...
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 977
+        runAsGroup: 977
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: searxng
+          image: searxng/searxng:2026.10.19-81371861f
+          # A fresh secret_key per start: it only signs image-proxy URLs and
+          # preference cookies, so nothing needs to survive a restart
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              SEARXNG_SECRET="$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
+              export SEARXNG_SECRET
+              exec /usr/local/searxng/entrypoint.sh
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          volumeMounts:
+            - name: settings
+              mountPath: /etc/searxng/settings.yml
+              subPath: settings.yml
+              readOnly: true
+      volumes:
+        - name: settings
+          configMap:
+            name: searxng-settings

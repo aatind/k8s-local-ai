@@ -173,6 +173,9 @@ spec:
               value: "3.14"
             - name: UV_PYTHON_INSTALL_DIR
               value: /uv_cache/python
+            # web_search backend (apps/searxng)
+            - name: SEARXNG_URL
+              value: http://searxng.searxng.svc:8080
             - name: HERMES_WEBUI_PASSWORD
               valueFrom:
                 secretKeyRef:
