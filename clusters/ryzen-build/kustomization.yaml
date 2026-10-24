@@ -1,0 +1,8 @@
+---
+# flux-system applies only its own directory. Each app under apps/ and
+# llms/ is applied by its own Kustomization (flux-system/custom-kustomization.yaml),
+# so it must not be listed here too.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- flux-system
