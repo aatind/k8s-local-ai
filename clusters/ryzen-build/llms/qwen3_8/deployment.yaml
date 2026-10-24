@@ -1,29 +1,29 @@
 ---
-# llama.cpp (ROCm) serving Qwen3.8-27B on one AMD Radeon RX 7900 XTX
-# (gfx1100, RDNA3, 24 GiB), with DFlash2 speculative decoding.
+# vLLM (ROCm) serving cyankiwi/Qwen3.8-27B-AWQ-INT4 on one AMD Radeon
+# RX 7900 XTX (gfx1100, RDNA3, 24 GiB).
 #
-# Why this stack on this card:
-#   - NVFP4 weights / fp8 KV need Blackwell / MI300+; gfx1100 has neither,
-#     so the target is a 4-bit GGUF (unsloth UD-Q4_K_M, ~15.3 GiB) and the
-#     KV cache is q8_0.
-#   - SGLang only supports CDNA (gfx942/gfx950) officially, and the earlier
-#     vLLM + AWQ attempt here needed a config patch and capped out at ~24k
-#     context (bf16 KV). llama.cpp ships a ROCm image built for gfx1100.
-#   - DFlash2 draft (incoai/Qwen3.8-27B-DFlash2) as GGUF; llama.cpp
-#     supports it (--spec-type draft-dflash) since PR #27342.
+# Why vLLM: the checkpoint is compressed-tensors W4A16 safetensors (int4,
+# asymmetric, group size 32), which llama.cpp can't load. Unlike the earlier
+# mattbucci AWQ build, its quantization_config already lists the vision
+# tower in "ignore", so it loads without a config.json patch. It carries no
+# kv_cache_scheme, so the KV cache stays bf16 (fp8 KV is software-emulated
+# on gfx1100 and measured ~2x slower here).
 #
-# VRAM budget (24 GiB). Only 16 of the 64 layers use full attention (4 KV
-# heads x 256), the rest are gated DeltaNet with a fixed-size state:
-#   target UD-Q4_K_M                    15.3 GiB
-#   DFlash2 draft Q4_K_M                 1.1 GiB  (sliding window 2048: ~40 MB KV)
-#   KV q8_0, 131072 tokens x 34 KiB      4.3 GiB
-#   DeltaNet state, compute buffers     ~1.5 GiB
-#                                      ~22.2 GiB -> ~1.5 GiB headroom
-# The native 262144 context only fits with q4_0 KV (same ~4.5 GiB). Swap
-# -c/-ctk/-ctv below if you want length over KV precision.
+# VRAM budget (24 GiB x 0.95). Only 16 of the 64 layers use full attention
+# (4 KV heads x 256), the rest are gated DeltaNet with a fixed-size state,
+# so the KV cache costs 64 KiB/token at bf16. Weights by component, from
+# the safetensors headers (19.6 GiB on disk):
+#   MLP int4 9.2, DeltaNet 3.1, full attention 0.9          13.2 GiB
+#   embed_tokens + lm_head, both bf16 (not quantized)        4.7 GiB
+#   vision tower 0.9, MTP head 0.8: not loaded (see args)    0 GiB
+#   resident weights                                       ~17.9 GiB
+#   HIP runtime, activations (2048-token chunks), graphs    ~1 GiB
+#   KV bf16                                                ~3.8 GiB -> ~60k tokens
+# --max-model-len auto takes whatever the KV pool holds; the startup log
+# prints it ("GPU KV cache size" / max_model_len). Pin it once known, so a
+# later image bump can't quietly shrink it under Hermes' context_length.
 #
-# Both files are pinned to a commit and checked by sha256 (llama.cpp's -hf
-# can't pin a revision), so the init container downloads them.
+# The repo is pinned to a commit; the init container downloads it once.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,37 +58,38 @@ spec:
         supplementalGroups:
           - 44    # video
           - 991   # render
-        # Kept from the previous manifest: AMD recommends unconfined for ROCm
-        # (HSA uses NUMA syscalls the default profile restricts).
+        # AMD recommends unconfined for ROCm (HSA uses NUMA syscalls the
+        # default profile restricts).
         seccompProfile:
           type: Unconfined
       terminationGracePeriodSeconds: 60
       initContainers:
-        # Downloads the pinned GGUFs once (~16.5 GiB), resumes a partial
-        # download, and rejects a file whose sha256 doesn't match.
-        - name: fetch-models
-          image: ghcr.io/ggml-org/llama.cpp:server-rocm-b11681
-          command: ["/bin/sh", "-c"]
+        # Downloads the pinned snapshot once (~19.6 GiB) and resumes a partial
+        # download. Also removes the previous llama.cpp GGUFs (~16.5 GiB):
+        # both don't fit the 30Gi local-path volume, which can't be expanded.
+        - name: fetch-model
+          image: vllm/vllm-openai-rocm:v0.29.0@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
+          command: ["python3", "-c"]
           args:
             - |
-              set -eu
-              mkdir -p /cache/models
-              fetch() {
-                url="$1"; file="/cache/models/$2"; sha="$3"
-                if [ -f "$file" ]; then echo "$2 present"; return; fi
-                curl -fL --retry 5 -C - -o "$file.partial" "$url"
-                echo "$sha  $file.partial" | sha256sum -c -
-                mv "$file.partial" "$file"
-              }
-              fetch https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf \
-                Qwen3.8-27B-UD-Q4_K_M.gguf \
-                322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482
-              fetch https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF/resolve/144eb06583b4fb0b6e54bc814b16a206a240f4d2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-                Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-                d169ad335929adc0d77e10e2523f968f3e75f547637ad739b0a137ccde111b5f
+              import glob, os
+              from huggingface_hub import snapshot_download
+              for f in glob.glob("/cache/models/Qwen3.8-27B-*.gguf*"):
+                  os.remove(f)
+                  print("removed", f)
+              snapshot_download(
+                  "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+                  revision="e3a700906e6a73ba4290b1873dc2ba8198527ab5",
+                  local_dir="/cache/models/Qwen3.8-27B-AWQ-INT4",
+              )
           env:
             - name: HOME
               value: /tmp
+            - name: HF_XET_HIGH_PERFORMANCE
+              value: "1"
+            # No Xet chunk cache: it would keep a second copy of the weights
+            - name: HF_XET_CHUNK_CACHE_SIZE_BYTES
+              value: "0"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -97,76 +98,82 @@ spec:
           resources:
             requests:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             limits:
-              memory: 2Gi
+              memory: 4Gi
           volumeMounts:
             - name: cache
               mountPath: /cache
             - name: tmp
               mountPath: /tmp
       containers:
-        - name: llama-server
-          # Official llama.cpp ROCm 7.2.1 build; its target list includes
-          # gfx1100. Pinned build (2026-10-16), DFlash2 support included.
-          image: ghcr.io/ggml-org/llama.cpp:server-rocm-b11681
+        - name: vllm
+          # The vLLM project's ROCm build of 0.29.0 (2026-09-09), pinned by
+          # digest. 10.7 GiB compressed; AMD's rocm/vllm builds are 23-29 GiB
+          # and, extracted, filled the node's disk (containerd shares the
+          # NVMe with the model volume).
+          image: vllm/vllm-openai-rocm:v0.29.0@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
+          command: ["vllm", "serve"]
           args:
-            - --model
-            - /cache/models/Qwen3.8-27B-UD-Q4_K_M.gguf
+            - /cache/models/Qwen3.8-27B-AWQ-INT4
             # The model name clients send
-            - --alias
+            - --served-model-name
             - qwen3.8-27b
             - --host
             - 0.0.0.0
             - --port
             - "8000"
-            # Everything on the GPU, and no auto-fitting: with --fit on,
-            # llama.cpp quietly moves layers to the CPU when VRAM runs short.
-            # Fail loudly instead, then lower -c.
-            - --n-gpu-layers
-            - all
-            - --fit
-            - "off"
-            - --ctx-size
-            - "131072"
-            # Quantized V cache needs flash attention
-            - --flash-attn
-            - "on"
-            - --cache-type-k
-            - q8_0
-            - --cache-type-v
-            - q8_0
-            # One user, one slot: the whole KV pool goes to that request
-            - --parallel
-            - "1"
-            # Thinking goes to reasoning_content. Tool calls are parsed from
-            # the GGUF's chat template; --jinja is on by default.
-            - --reasoning-format
-            - deepseek
-            # DFlash2 speculative decoding; 7 draft tokens is the draft
-            # publisher's setting for llama.cpp.
-            - --spec-type
-            - draft-dflash
-            - --model-draft
-            - /cache/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
-            - --spec-draft-ngl
-            - all
-            - --spec-draft-n-max
-            - "7"
-            # Qwen3.8's recommended thinking-mode sampling (model card);
-            # llama.cpp's defaults differ (temp 0.8, top-k 40, min-p 0.05).
-            # Requests can still override these.
-            - --temp
-            - "1.0"
-            - --top-p
+            - --max-model-len
+            - auto
+            # vLLM checks free VRAM at startup and refuses to start if this
+            # fraction isn't available. Each 0.01 is ~0.24 GiB, ~3.9k tokens.
+            # Drop to 0.90 if the card also drives a display.
+            - --gpu-memory-utilization
             - "0.95"
-            - --top-k
-            - "20"
-            - --min-p
-            - "0"
+            # fp8 KV halves the per-token cost (~120k tokens), but gfx1100 has
+            # no native fp8: an earlier vLLM run here measured it ~2x slower
+            # per context token. Worth it only if long context beats speed.
+            # - --kv-cache-dtype
+            # - fp8
+            # One user, one sequence: the whole KV pool goes to that request
+            - --max-num-seqs
+            - "1"
+            - --cudagraph-capture-sizes
+            - "1"
+            # Text only: skips the vision encoder and frees its VRAM
+            - --language-model-only
+            # Thinking goes to the reasoning field; tool calls in Qwen3.8's
+            # XML format. The wrong tool parser fails silently (calls come
+            # back as prose).
+            - --reasoning-parser
+            - qwen3
+            - --enable-auto-tool-choice
+            - --tool-call-parser
+            - qwen3_coder
+            # The checkpoint keeps the MTP head. Turning it on costs context:
+            # 0.8 GiB of weights plus a 17th attention layer's KV (~13k
+            # tokens of the ~60k); check vllm:spec_decode_num_accepted_tokens
+            # on /metrics after turning it on.
+            # - --speculative-config
+            # - '{"method":"mtp","num_speculative_tokens":1}'
+            #
+            # Sampling comes from the checkpoint's generation_config.json
+            # (temp 1.0, top-p 0.95, top-k 20: Qwen3.8's thinking-mode
+            # recommendation). Requests can still override these.
           env:
             - name: HOME
               value: /tmp
+            # torch.compile / Triton kernel caches on the volume, so restarts
+            # skip recompiling
+            - name: VLLM_CACHE_ROOT
+              value: /cache/vllm
+            - name: TRITON_CACHE_DIR
+              value: /cache/triton
+            - name: FLASH_ATTENTION_TRITON_AMD_ENABLE
+              value: "TRUE"
+            # Never reach out to the Hub at runtime: serve the local snapshot only
+            - name: HF_HUB_OFFLINE
+              value: "1"
             # gfx1100 is natively supported - do NOT set HSA_OVERRIDE_GFX_VERSION.
           securityContext:
             allowPrivilegeEscalation: false
@@ -177,8 +184,6 @@ spec:
             - name: http
               containerPort: 8000
               protocol: TCP
-          # Weights are read through the page cache on load; the prompt
-          # cache (--cache-ram, default 8 GiB) lives in host RAM too.
           resources:
             requests:
               cpu: "4"
@@ -186,14 +191,15 @@ spec:
             limits:
               amd.com/gpu: 1
               memory: 32Gi
-          # The init container did the download; this is load only.
-          # /health is 503 while loading, 200 once ready.
+          # The init container did the download; this is load, compile and
+          # graph capture (slowest on the first start, before the caches exist).
+          # /health refuses connections until the engine is up.
           startupProbe:
             httpGet:
               path: /health
               port: http
             periodSeconds: 15
-            failureThreshold: 40
+            failureThreshold: 80
           readinessProbe:
             httpGet:
               path: /health
@@ -211,10 +217,17 @@ spec:
               mountPath: /cache
             - name: tmp
               mountPath: /tmp
+            # The API server and engine core talk over shared memory
+            - name: shm
+              mountPath: /dev/shm
       volumes:
         - name: cache
           persistentVolumeClaim:
             claimName: qwen3-8-27b-cache
         - name: tmp
           emptyDir:
-            sizeLimit: 1Gi
+            sizeLimit: 4Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi

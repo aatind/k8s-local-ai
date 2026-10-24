@@ -1,5 +1,5 @@
 ---
-# Pinned GGUFs for qwen3-8-27b (target ~15.3 GiB + DFlash2 draft ~1.1 GiB).
+# Pinned qwen3-8-27b snapshot (~19.6 GiB) plus vLLM/Triton compile caches.
 # local-path: lives on the node's 143 GiB NVMe, shared with containerd's images.
 apiVersion: v1
 kind: PersistentVolumeClaim

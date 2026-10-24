@@ -10,12 +10,13 @@ metadata:
 data:
   config.yaml: |
     model:
-      # The local llama.cpp server (llms/qwen3_8); it runs without an API key
+      # The local vLLM server (llms/qwen3_8); it runs without an API key
       default: qwen3.8-27b
       provider: custom
       base_url: http://qwen3-8-27b.qwen38.svc:8000/v1
-      # Matches llama-server's --ctx-size
-      context_length: 131072
+      # At most vLLM's max_model_len (auto-sized, ~60k: read the startup log);
+      # above it, long requests are rejected
+      context_length: 32768
     web:
       # apps/searxng, reached through SEARXNG_URL (set in the Deployment)
       search_backend: searxng
