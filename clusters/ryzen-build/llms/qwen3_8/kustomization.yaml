@@ -7,3 +7,16 @@ resources:
 - pvc.yaml
 - deployment.yaml
 - service.yaml
+# Temporary: keeps flux-system from pruning these objects while it stops
+# applying this directory (see clusters/ryzen-build/kustomization.yaml).
+# Only metadata is patched, so pod templates and workloads don't change.
+patches:
+- target:
+    name: ".*"
+  patch: |-
+    apiVersion: v1
+    kind: not-used
+    metadata:
+      name: not-used
+      annotations:
+        kustomize.toolkit.fluxcd.io/prune: disabled
