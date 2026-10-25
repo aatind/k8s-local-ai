@@ -14,9 +14,9 @@ data:
       default: qwen3.8-27b
       provider: custom
       base_url: http://qwen3-8-27b.qwen38.svc:8000/v1
-      # At most vLLM's max_model_len (auto-sized, ~60k: read the startup log);
-      # above it, long requests are rejected
-      context_length: 32768
+      # vLLM's --max-model-len (llms/qwen3_8); above it, long requests are
+      # rejected
+      context_length: 44000
     web:
       # apps/searxng, reached through SEARXNG_URL (set in the Deployment)
       search_backend: searxng

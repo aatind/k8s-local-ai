@@ -5,23 +5,30 @@
 # Why vLLM: the checkpoint is compressed-tensors W4A16 safetensors (int4,
 # asymmetric, group size 32), which llama.cpp can't load. Unlike the earlier
 # mattbucci AWQ build, its quantization_config already lists the vision
-# tower in "ignore", so it loads without a config.json patch. It carries no
-# kv_cache_scheme, so the KV cache stays bf16 (fp8 KV is software-emulated
-# on gfx1100 and measured ~2x slower here).
+# tower in "ignore", so it loads without a config.json patch.
 #
-# VRAM budget (24 GiB x 0.95). Only 16 of the 64 layers use full attention
-# (4 KV heads x 256), the rest are gated DeltaNet with a fixed-size state,
-# so the KV cache costs 64 KiB/token at bf16. Weights by component, from
-# the safetensors headers (19.6 GiB on disk):
-#   MLP int4 9.2, DeltaNet 3.1, full attention 0.9          13.2 GiB
-#   embed_tokens + lm_head, both bf16 (not quantized)        4.7 GiB
-#   vision tower 0.9, MTP head 0.8: not loaded (see args)    0 GiB
-#   resident weights                                       ~17.9 GiB
-#   HIP runtime, activations (2048-token chunks), graphs    ~1 GiB
-#   KV bf16                                                ~3.8 GiB -> ~60k tokens
-# --max-model-len auto takes whatever the KV pool holds; the startup log
-# prints it ("GPU KV cache size" / max_model_len). Pin it once known, so a
-# later image bump can't quietly shrink it under Hermes' context_length.
+# Context size, measured on this card (vLLM 0.29.0, --max-model-len auto,
+# then a near-max prompt to confirm it doesn't OOM). Only 16 of the 64
+# layers use full attention (4 KV heads x 256 -> 64 KiB/token at bf16);
+# the rest are gated DeltaNet with a fixed-size state.
+#   resident weights (vision tower is built anyway, and the RDNA W4A16
+#   kernel unpacks the zero points to bf16)                   19.3 GiB
+#   default (torch.compile + graphs) at 0.95: activation peak 2.4 GiB,
+#     KV -0.67 GiB -> won't start; same with smaller batches/no prefix cache
+#   --enforce-eager: activation peak 0.1 GiB
+#     0.95 -> 2.2 GiB KV, 32k tokens
+#     0.98 -> 2.9 GiB KV, 44,688 tokens                       <- used
+#     0.98 + --kv-cache-dtype fp8 -> 89,376 tokens
+# Speed at 0.98 (one request), decode / prefill:
+#   bf16 at 1k context    19.6 tok/s / 800 tok/s
+#   bf16 at 44k            2.1 tok/s / 460 tok/s (full prompt ~96 s)
+#   fp8  at 1k context    18.0 tok/s / 790 tok/s
+#   fp8  at 89k            0.8 tok/s / 224 tok/s (full prompt ~6.6 min)
+# Decode attention falls back to a Triton kernel, so long context gets
+# slow either way. fp8 has no calibrated scales in this checkpoint (scale
+# 1.0); it's an opt-in for when 44k isn't enough.
+# Don't leave VLLM_LOGGING_LEVEL=DEBUG on: it logs every op dispatch and
+# slows decode ~250x.
 #
 # The repo is pinned to a commit; the init container downloads it once.
 apiVersion: apps/v1
@@ -66,7 +73,8 @@ spec:
       initContainers:
         # Downloads the pinned snapshot once (~19.6 GiB) and resumes a partial
         # download. Also removes the previous llama.cpp GGUFs (~16.5 GiB):
-        # both don't fit the 30Gi local-path volume, which can't be expanded.
+        # local-path doesn't enforce the 30Gi, but the volume shares the
+        # node's NVMe with containerd's images.
         - name: fetch-model
           image: vllm/vllm-openai-rocm:v0.29.0@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
           command: ["python3", "-c"]
@@ -85,8 +93,6 @@ spec:
           env:
             - name: HOME
               value: /tmp
-            - name: HF_XET_HIGH_PERFORMANCE
-              value: "1"
             # No Xet chunk cache: it would keep a second copy of the weights
             - name: HF_XET_CHUNK_CACHE_SIZE_BYTES
               value: "0"
@@ -99,8 +105,10 @@ spec:
             requests:
               cpu: "1"
               memory: 1Gi
+            # Xet downloads buffer in memory; 4Gi was OOM-killed. Its
+            # HF_XET_HIGH_PERFORMANCE mode needs even more, so it's off.
             limits:
-              memory: 4Gi
+              memory: 8Gi
           volumeMounts:
             - name: cache
               mountPath: /cache
@@ -123,25 +131,38 @@ spec:
             - 0.0.0.0
             - --port
             - "8000"
+            # Measured ceiling at 0.98 is 44,688 (see header). Pinned, so a
+            # change that shrinks the KV pool fails startup loudly instead of
+            # quietly dropping below Hermes' context_length.
             - --max-model-len
-            - auto
+            - "44000"
             # vLLM checks free VRAM at startup and refuses to start if this
             # fraction isn't available. Each 0.01 is ~0.24 GiB, ~3.9k tokens.
-            # Drop to 0.90 if the card also drives a display.
+            # The card drives no display; if it ever does, drop to 0.95 and
+            # --max-model-len to 32000.
             - --gpu-memory-utilization
-            - "0.95"
-            # fp8 KV halves the per-token cost (~120k tokens), but gfx1100 has
-            # no native fp8: an earlier vLLM run here measured it ~2x slower
-            # per context token. Worth it only if long context beats speed.
+            - "0.98"
+            # No torch.compile or graphs: their 2.3 GiB of workspace is the
+            # difference between 44k tokens and not starting at all
+            - --enforce-eager
+            # Doubles the context (set --max-model-len 88000 and Hermes'
+            # context_length with it); see the header for the cost
             # - --kv-cache-dtype
             # - fp8
             # One user, one sequence: the whole KV pool goes to that request
             - --max-num-seqs
             - "1"
-            - --cudagraph-capture-sizes
-            - "1"
-            # Text only: skips the vision encoder and frees its VRAM
+            # Smaller prefill chunks, smaller activation peak
+            - --max-num-batched-tokens
+            - "512"
+            # Prefix caching forces DeltaNet state snapshots ("align" mode),
+            # which cost KV memory
+            - --no-enable-prefix-caching
+            # Text only. --language-model-only alone still built the vision
+            # tower; the hf override is the one that's measured here.
             - --language-model-only
+            - --hf-overrides
+            - '{"language_model_only": true}'
             # Thinking goes to the reasoning field; tool calls in Qwen3.8's
             # XML format. The wrong tool parser fails silently (calls come
             # back as prose).
@@ -150,10 +171,10 @@ spec:
             - --enable-auto-tool-choice
             - --tool-call-parser
             - qwen3_coder
-            # The checkpoint keeps the MTP head. Turning it on costs context:
-            # 0.8 GiB of weights plus a 17th attention layer's KV (~13k
-            # tokens of the ~60k); check vllm:spec_decode_num_accepted_tokens
-            # on /metrics after turning it on.
+            # The checkpoint keeps the MTP head. Not measured: it costs 0.8 GiB
+            # of weights plus a 17th attention layer's KV, more than the 0.98
+            # headroom over 32k; check vllm:spec_decode_num_accepted_tokens
+            # on /metrics if it's ever turned on.
             # - --speculative-config
             # - '{"method":"mtp","num_speculative_tokens":1}'
             #
@@ -169,6 +190,13 @@ spec:
               value: /cache/vllm
             - name: TRITON_CACHE_DIR
               value: /cache/triton
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /cache/inductor
+            # UID 10001 has no passwd entry in the image; torch's cache code
+            # calls getpass.getuser(), which reads $USER before failing on
+            # getpwuid().
+            - name: USER
+              value: vllm
             - name: FLASH_ATTENTION_TRITON_AMD_ENABLE
               value: "TRUE"
             # Never reach out to the Hub at runtime: serve the local snapshot only
