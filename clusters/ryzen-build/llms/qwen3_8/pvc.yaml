@@ -1,5 +1,6 @@
 ---
-# Pinned GGUFs for qwen3-8-27b (target ~15.3 GiB + DFlash2 draft ~1.1 GiB).
+# Pinned GGUF for qwen3-8-27b (Qwen3.6-27B Q6_K, ~21.0 GiB; the old
+# Qwen3.8 Q4_K_M + DFlash2 files can be deleted from the volume).
 # local-path: lives on the node's 143 GiB NVMe, shared with containerd's images.
 apiVersion: v1
 kind: PersistentVolumeClaim
