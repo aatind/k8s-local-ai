@@ -149,23 +149,24 @@ spec:
             # RAM matters with mlock + 21 GiB of weights
             - --cache-ram
             - "0"
-            - --cache-idle-slots
-            - "false"
+            # cache-idle-slots false: the flag defaults to enabled, so it
+            # must be disabled explicitly (presence-only pair)
+            - --no-cache-idle-slots
             # One user, one slot: the whole KV pool goes to that request
             - --parallel
             - "1"
-            # Pin weights; no silent page-cache eviction under memory pressure
-            - --mlock
-            - "true"
+            # Pin weights; no silent page-cache eviction under memory pressure.
+            # (b11681: --mlock is gone - it's a --load-mode value; bool flags
+            #  are presence-only pairs, and --reasoning takes on/off/auto.)
+            - --load-mode
+            - mlock
             # Text-only: don't load the vision mmproj
             - --no-mmproj
-            - "true"
             # Chat template (and its reasoning/tool-call tags) from the GGUF
             - --jinja
-            - "true"
             # Thinking on: reasoning goes to reasoning_content
             - --reasoning
-            - "true"
+            - "on"
             # Two-stage speculation: ngram-mod drafts verbatim continuations,
             # the model's MTP heads draft the rest; MTP drafts 2 tokens,
             # ngram-mod keeps drafts between 8 and 32 after a 24-token match.
