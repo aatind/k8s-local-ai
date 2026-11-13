@@ -78,14 +78,22 @@ spec:
               mkdir -p /cache/models
               fetch() {
                 url="$1"; file="/cache/models/$2"; sha="$3"
-                if [ -f "$file" ]; then echo "$2 present"; return; fi
+                if [ -f "$file" ]; then
+                  # same filename can exist from another repo (e.g. the
+                  # non-MTP build) - checksum decides; move, never delete
+                  if echo "$sha  $file" | sha256sum -c - 2>/dev/null; then
+                    echo "$2 present, sha ok"; return
+                  fi
+                  mv "$file" "$file.stale-$(date +%s)"
+                  echo "$2 sha mismatch, moved aside as stale"
+                fi
                 curl -fL --retry 5 -C - -o "$file.partial" "$url"
                 echo "$sha  $file.partial" | sha256sum -c -
                 mv "$file.partial" "$file"
               }
-              fetch https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/82d411acf4a06cfb8d9b073a5211bf410bfc29bf/Qwen3.6-27B-Q6_K.gguf \
+              fetch https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/5cb35eb3dcbf52dbce5f87dbc64df6aaffadcace/Qwen3.6-27B-Q6_K.gguf \
                 Qwen3.6-27B-Q6_K.gguf \
-                ec1805fe87e6519c461c1ed2d179865464a875ed241032ead65a354f979cfe14
+                773f1bf0be0589d056ce05476a8a135b50494a3f2ecc3f8f0c4f2c3594bba02e
           env:
             - name: HOME
               value: /tmp
@@ -204,6 +212,9 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+              # mlock() the 21 GiB of weights past RLIMIT_MEMLOCK
+              # (--load-mode mlock; without it the lock fails and is skipped)
+              add: ["IPC_LOCK"]
           ports:
             - name: http
               containerPort: 8000
