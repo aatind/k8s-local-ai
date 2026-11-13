@@ -1,29 +1,29 @@
 ---
-# llama.cpp (ROCm) serving Qwen3.8-27B on one AMD Radeon RX 7900 XTX
-# (gfx1100, RDNA3, 24 GiB), with DFlash2 speculative decoding.
+# llama.cpp (ROCm) serving Qwen3.6-27B (Q6_K GGUF) on one AMD Radeon RX 7900 XTX
+# (gfx1100, RDNA3, 24 GiB), with the model's built-in MTP heads plus ngram-mod
+# chained in front of them for speculative decoding (unsloth's recommended
+# llama.cpp recipe for Qwen3.6: ngram catches verbatim repeats, MTP drafts
+# novel tokens; no separate draft GGUF needed).
 #
 # Why this stack on this card:
 #   - NVFP4 weights / fp8 KV need Blackwell / MI300+; gfx1100 has neither,
-#     so the target is a 4-bit GGUF (unsloth UD-Q4_K_M, ~15.3 GiB) and the
-#     KV cache is q8_0.
+#     so the target is a plain-quant GGUF (Q6_K, ~21.0 GiB) with quantized KV.
 #   - SGLang only supports CDNA (gfx942/gfx950) officially, and the earlier
 #     vLLM + AWQ attempt here needed a config patch and capped out at ~24k
 #     context (bf16 KV). llama.cpp ships a ROCm image built for gfx1100.
-#   - DFlash2 draft (incoai/Qwen3.8-27B-DFlash2) as GGUF; llama.cpp
-#     supports it (--spec-type draft-dflash) since PR #27342.
 #
-# VRAM budget (24 GiB). Only 16 of the 64 layers use full attention (4 KV
-# heads x 256), the rest are gated DeltaNet with a fixed-size state:
-#   target UD-Q4_K_M                    15.3 GiB
-#   DFlash2 draft Q4_K_M                 1.1 GiB  (sliding window 2048: ~40 MB KV)
-#   KV q8_0, 131072 tokens x 34 KiB      4.3 GiB
-#   DeltaNet state, compute buffers     ~1.5 GiB
-#                                      ~22.2 GiB -> ~1.5 GiB headroom
-# The native 262144 context only fits with q4_0 KV (same ~4.5 GiB). Swap
-# -c/-ctk/-ctv below if you want length over KV precision.
+# VRAM budget (24 GiB). Q6_K weights are 21.0 GiB - the KV cache
+# (131000 tokens, k q5_0 / v q4_0), the MTP heads, the ngram-mod pool
+# (~16 MB) and the compute buffers must live in what's left. Tight: if
+# llama.cpp fails to allocate on startup, lower --ctx-size first.
 #
-# Both files are pinned to a commit and checked by sha256 (llama.cpp's -hf
-# can't pin a revision), so the init container downloads them.
+# Sampling/sampling-adjacent knobs below mirror the requested Qwen3.6-27B
+# config verbatim (thinking mode: temp 0.6, top-k 20, top-p 0.95, min-p 0);
+# --spec-type draft-mtp,ngram-mod replaces the old DFlash2 drafter, so the
+# draft GGUF is gone from the init container too.
+#
+# The file is pinned to a commit and checked by sha256 (llama.cpp's -hf
+# can't pin a revision), so the init container downloads it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -64,8 +64,11 @@ spec:
           type: Unconfined
       terminationGracePeriodSeconds: 60
       initContainers:
-        # Downloads the pinned GGUFs once (~16.5 GiB), resumes a partial
+        # Downloads the pinned GGUF once (~21 GiB), resumes a partial
         # download, and rejects a file whose sha256 doesn't match.
+        # NOTE: the old Qwen3.8-27B Q4_K_M + DFlash2 files (16.4 GiB) on the
+        # 30 Gi PVC must be removed once before this download fits; the PVC
+        # otherwise fills mid-download. They are re-downloadable and unused now.
         - name: fetch-models
           image: ghcr.io/ggml-org/llama.cpp:server-rocm-b11681
           command: ["/bin/sh", "-c"]
@@ -80,12 +83,9 @@ spec:
                 echo "$sha  $file.partial" | sha256sum -c -
                 mv "$file.partial" "$file"
               }
-              fetch https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf \
-                Qwen3.8-27B-UD-Q4_K_M.gguf \
-                322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482
-              fetch https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF/resolve/144eb06583b4fb0b6e54bc814b16a206a240f4d2/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-                Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-                d169ad335929adc0d77e10e2523f968f3e75f547637ad739b0a137ccde111b5f
+              fetch https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/82d411acf4a06cfb8d9b073a5211bf410bfc29bf/Qwen3.6-27B-Q6_K.gguf \
+                Qwen3.6-27B-Q6_K.gguf \
+                ec1805fe87e6519c461c1ed2d179865464a875ed241032ead65a354f979cfe14
           env:
             - name: HOME
               value: /tmp
@@ -108,14 +108,17 @@ spec:
       containers:
         - name: llama-server
           # Official llama.cpp ROCm 7.2.1 build; its target list includes
-          # gfx1100. Pinned build (2026-10-16), DFlash2 support included.
+          # gfx1100. Pinned build (2026-10-16) - new enough for Qwen3.6,
+          # draft-mtp and ngram-mod (the draft-mtp rename landed 2026-05-13).
           image: ghcr.io/ggml-org/llama.cpp:server-rocm-b11681
           args:
             - --model
-            - /cache/models/Qwen3.8-27B-UD-Q4_K_M.gguf
-            # The model name clients send
+            - /cache/models/Qwen3.6-27B-Q6_K.gguf
+            # The model name clients send. NOTE: renamed from qwen3.8-27b -
+            # clients must request "Qwen3.6-27B-Q6_K" now (hermes local27b
+            # alias sends qwen3.8-27b; update or expect 404 model-not-found).
             - --alias
-            - qwen3.8-27b
+            - Qwen3.6-27B-Q6_K
             - --host
             - 0.0.0.0
             - --port
@@ -124,46 +127,73 @@ spec:
             # llama.cpp quietly moves layers to the CPU when VRAM runs short.
             # Fail loudly instead, then lower -c.
             - --n-gpu-layers
-            - all
+            - "999"
             - --fit
             - "off"
             - --ctx-size
-            - "131072"
+            - "131000"
             # Quantized V cache needs flash attention
             - --flash-attn
             - "on"
             - --cache-type-k
-            - q8_0
+            - q5_0
             - --cache-type-v
-            - q8_0
+            - q4_0
+            # KV caches for the MTP draft pass (draft-mtp heads share the
+            # target's context graph)
+            - --cache-type-k-draft
+            - q4_0
+            - --cache-type-v-draft
+            - q4_0
+            # Prompt cache off: single user, and every GiB of pinned host
+            # RAM matters with mlock + 21 GiB of weights
+            - --cache-ram
+            - "0"
+            - --cache-idle-slots
+            - "false"
             # One user, one slot: the whole KV pool goes to that request
             - --parallel
             - "1"
-            # Thinking goes to reasoning_content. Tool calls are parsed from
-            # the GGUF's chat template; --jinja is on by default.
-            - --reasoning-format
-            - deepseek
-            # DFlash2 speculative decoding; 7 draft tokens is the draft
-            # publisher's setting for llama.cpp.
+            # Pin weights; no silent page-cache eviction under memory pressure
+            - --mlock
+            - "true"
+            # Text-only: don't load the vision mmproj
+            - --no-mmproj
+            - "true"
+            # Chat template (and its reasoning/tool-call tags) from the GGUF
+            - --jinja
+            - "true"
+            # Thinking on: reasoning goes to reasoning_content
+            - --reasoning
+            - "true"
+            # Two-stage speculation: ngram-mod drafts verbatim continuations,
+            # the model's MTP heads draft the rest; MTP drafts 2 tokens,
+            # ngram-mod keeps drafts between 8 and 32 after a 24-token match.
             - --spec-type
-            - draft-dflash
-            - --model-draft
-            - /cache/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
-            - --spec-draft-ngl
-            - all
+            - draft-mtp,ngram-mod
             - --spec-draft-n-max
-            - "7"
-            # Qwen3.8's recommended thinking-mode sampling (model card);
+            - "2"
+            - --spec-ngram-mod-n-match
+            - "24"
+            - --spec-ngram-mod-n-min
+            - "8"
+            - --spec-ngram-mod-n-max
+            - "32"
+            # Qwen3.6's recommended thinking-mode sampling (model card);
             # llama.cpp's defaults differ (temp 0.8, top-k 40, min-p 0.05).
             # Requests can still override these.
             - --temp
-            - "1.0"
+            - "0.6"
             - --top-p
             - "0.95"
             - --top-k
             - "20"
             - --min-p
-            - "0"
+            - "0.0"
+            - --presence-penalty
+            - "0.0"
+            - --repeat-penalty
+            - "1.0"
           env:
             - name: HOME
               value: /tmp
@@ -177,12 +207,12 @@ spec:
             - name: http
               containerPort: 8000
               protocol: TCP
-          # Weights are read through the page cache on load; the prompt
-          # cache (--cache-ram, default 8 GiB) lives in host RAM too.
+          # mlock pins the 21 GiB of weights in host RAM (not reclaimable
+          # page cache), so request the real footprint instead of 8Gi.
           resources:
             requests:
               cpu: "4"
-              memory: 8Gi
+              memory: 24Gi
             limits:
               amd.com/gpu: 1
               memory: 32Gi
