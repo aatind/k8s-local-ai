@@ -131,11 +131,13 @@ spec:
             - 0.0.0.0
             - --port
             - "8000"
-            # Everything on the GPU, and no auto-fitting: with --fit on,
-            # llama.cpp quietly moves layers to the CPU when VRAM runs short.
-            # Fail loudly instead, then lower -c.
+            # Everything on the GPU would need ~25.3 GiB (21.3 GiB weights
+            # + ~3.2 GiB KV at 131k + compute buffers) > 24 GiB of the XTX -
+            # ngl 999 OOMs. 56 of 64 layers on GPU; the CPU tail costs a few
+            # tok/s but makes it fit (verified: server loads + completes).
+            # Fail loudly on the rest (--fit off), then lower -c.
             - --n-gpu-layers
-            - "999"
+            - "56"
             - --fit
             - "off"
             - --ctx-size
