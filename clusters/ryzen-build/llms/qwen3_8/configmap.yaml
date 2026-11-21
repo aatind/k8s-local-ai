@@ -13,7 +13,6 @@ data:
     server:
       port: 8000
       host: "::"
-      api-key-env: davdav
     models:
       qwen3-8-27b:
         model: /models/qwen3.8-27b-iq4r-l-v4.rad
