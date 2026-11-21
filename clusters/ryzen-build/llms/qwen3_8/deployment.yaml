@@ -58,7 +58,7 @@ spec:
         # Downloads the radiance model container (~17.4 GiB), resumes partial
         # downloads, and removes the old GGUF to free PVC space.
         - name: fetch-model
-          image: curlimages/curl:8
+          image: curlimages/curl:8.23.0
           command: ["/bin/sh", "-c"]
           args:
             - |
