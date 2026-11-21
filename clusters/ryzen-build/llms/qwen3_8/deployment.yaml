@@ -94,7 +94,7 @@ spec:
               mountPath: /tmp
       containers:
         - name: radiance
-          image: stilldeadcode/radiance:latest
+          image: stilldeadcode/radiance:2.2.0
           args:
             - --config
             - /etc/radiance/radiance.yaml
