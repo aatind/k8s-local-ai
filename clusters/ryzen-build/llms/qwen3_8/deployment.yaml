@@ -1,9 +1,16 @@
 ---
 # Radiance serving Qwen3.8-27B IQ4R-L-V4 (~17.4 GiB) on one AMD Radeon RX 7900 XTX
-# (gfx1100, RDNA3, 24 GiB VRAM) via the libr3d kernel library.
+# (gfx1100, RDNA3, 24 GiB VRAM).
 #
-# Replaces llama.cpp + Qwen3.6-27B Q6_K GGUF. Radiance is purpose-built for
-# AMD GPUs — RDNA3 kernels (libr3d) target gfx11xx natively, no HSA override needed.
+# Replaces llama.cpp + Qwen3.6-27B Q6_K GGUF.
+#
+# Image: aatind/radiance:2.2.0-gfx1100, which is stilldeadcode/radiance:2.2.0 with libhalo
+# rebuilt for gfx1100, built and published from container-images/radiance-gfx1100.
+# The stock image can't serve this model on this card: its gfx11 library (libr3d)
+# has no i8a8h GEMMs (the IQR trunk), no head_dim-256 paged attention and no i8 KV,
+# and startup stops with "rad_arch_declare returned invalid argument". libhalo
+# (built upstream for Strix Halo, gfx1151 only) has all three; gfx1100 shares
+# its ISA and WMMA layout. Its tuning is gfx1151's, not measured on this card.
 #
 # Model: qwen3.8-27b-iq4r-l-v4.rad (17.4 GiB, IQR-V4 trellis quant, ~4.5 bits/weight)
 #   - StillDeadcode's radiance-optimized container with weights, tokenizer, chat template
@@ -92,7 +99,7 @@ spec:
               mountPath: /tmp
       containers:
         - name: radiance
-          image: stilldeadcode/radiance:2.2.0
+          image: aatind/radiance:2.2.0-gfx1100
           args:
             - --config
             - /etc/radiance/radiance.yaml
