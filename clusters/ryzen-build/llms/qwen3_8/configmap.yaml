@@ -8,8 +8,6 @@ data:
   radiance.yaml: |
     server:
       port: 8000
-    memory:
-      gpu-headroom-mib: 96
     models:
       qwen3-8-27b:
         model: /cache/models/qwen3.8-27b-iq4r-l-v4.rad
