@@ -1,26 +1,39 @@
 ---
-# Radiance serving Qwen3.8-27B IQ4R-L-V4 (~17.4 GiB) on one AMD Radeon RX 7900 XTX
-# (gfx1100, RDNA3, 24 GiB VRAM) via the libr3d kernel library.
+# llama.cpp (ROCm) serving Qwen3.6-27B (Q6_K GGUF) on one AMD Radeon RX 7900 XTX
+# (gfx1100, RDNA3, 24 GiB), with the model's built-in MTP heads plus ngram-mod
+# chained in front of them for speculative decoding (unsloth's recommended
+# llama.cpp recipe for Qwen3.6: ngram catches verbatim repeats, MTP drafts
+# novel tokens; no separate draft GGUF needed).
 #
-# Replaces llama.cpp + Qwen3.6-27B Q6_K GGUF. Radiance is purpose-built for
-# AMD GPUs — RDNA3 kernels (libr3d) target gfx11xx natively, no HSA override needed.
+# Why this stack on this card:
+#   - NVFP4 weights / fp8 KV need Blackwell / MI300+; gfx1100 has neither,
+#     so the target is a plain-quant GGUF (Q6_K, ~21.0 GiB) with quantized KV.
+#   - SGLang only supports CDNA (gfx942/gfx950) officially, and the earlier
+#     vLLM + AWQ attempt here needed a config patch and capped out at ~24k
+#     context (bf16 KV). llama.cpp ships a ROCm image built for gfx1100.
 #
-# Model: qwen3.8-27b-iq4r-l-v4.rad (17.4 GiB, IQR-V4 trellis quant, ~4.5 bits/weight)
-#   - StillDeadcode's radiance-optimized container with weights, tokenizer, chat template
-#   - IQ4R-L ("large" trellis) is the best quality that fits on one 24 GB card
-#     with headroom for KV cache (i8, 250K context, 2 sequences) and compute buffers.
-#   - Source: https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4
+# VRAM budget (24 GiB). Q6_K weights are 21.0 GiB - the KV cache
+# (131000 tokens, k q5_0 / v q4_0), the MTP heads, the ngram-mod pool
+# (~16 MB) and the compute buffers must live in what's left. Tight: if
+# llama.cpp fails to allocate on startup, lower --ctx-size first.
 #
-# Radiance config is in configmap.yaml (mounted as /etc/radiance/radiance.yaml).
-# Server keys: tp=1, max-num-seqs=2, max-model-len=250000, kv-cache-dtype=i8.
+# Sampling/sampling-adjacent knobs below mirror the requested Qwen3.6-27B
+# config verbatim (thinking mode: temp 0.6, top-k 20, top-p 0.95, min-p 0);
+# --spec-type draft-mtp,ngram-mod replaces the old DFlash2 drafter, so the
+# draft GGUF is gone from the init container too.
 #
-# VRAM budget (24 GiB):
-#   Weights (IQ4R-L):  ~17.4 GiB
-#   KV cache (i8, 2 seq x 250K): ~3.8 GiB
-#   Compute buffers + gpu-headroom: ~2.8 GiB
+# The file is pinned to a commit and checked by sha256 (llama.cpp's -hf
+# can't pin a revision), so the init container downloads it.
 #
-# API: OpenAI-compatible at /v1 (chat, completions), same port 8000 / NodePort 30800.
-# Dashboard at http://<node-ip>:30800/
+# Why not Radiance (stilldeadcode/radiance:2.2.0, tried in #12-#18):
+# its gfx11 kernel library (libr3d) cannot serve Qwen3.x-27B on this card.
+# The IQR-V4 containers (qwen3.8-27b-iq*r-v4.rad) run their trunk at
+# dtype i8a8h, whose GEMMs exist only in libr4d (gfx1201) and libhalo
+# (gfx1151); startup stops with "rad_arch_declare returned invalid
+# argument ... gemm_nt_q dtype=i8a8h ... no kernel in the loaded
+# libraries". Other formats would not help: libr3d's paged attention is
+# head_dim 128 with bf16/fp8 KV only, and the 27B has head_dim 256 with an
+# i8 KV cache. Revisit if a later libr3d adds these rows.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,6 +43,7 @@ metadata:
     app: qwen3-8-27b
 spec:
   replicas: 1
+  # One GPU, one copy of the weights: stop the old pod before starting a new one
   strategy:
     type: Recreate
   selector:
@@ -42,6 +56,9 @@ spec:
     spec:
       nodeSelector:
         amd.com/gpu.device-id: "744c"     # Navi 31 / 7900 XTX
+      # Non-root, read-only image. The AMD device plugin passes
+      # /dev/kfd and /dev/dri/renderD* in with the host's group ownership,
+      # so the pod needs those GIDs (check on the node: getent group render video).
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -51,26 +68,43 @@ spec:
         supplementalGroups:
           - 44    # video
           - 991   # render
+        # Kept from the previous manifest: AMD recommends unconfined for ROCm
+        # (HSA uses NUMA syscalls the default profile restricts).
         seccompProfile:
           type: Unconfined
       terminationGracePeriodSeconds: 60
       initContainers:
-        # Downloads the radiance model container (~17.4 GiB), resumes partial
-        # downloads, and removes the old GGUF to free PVC space.
-        - name: fetch-model
-          image: curlimages/curl:8.23.0
+        # Downloads the pinned GGUF once (~21 GiB), resumes a partial
+        # download, and rejects a file whose sha256 doesn't match.
+        # The Radiance container (qwen3.8-27b-iq4r-l-v4.rad, 17.4 GiB) is
+        # removed first: it and the GGUF don't both fit on the 30 Gi PVC.
+        - name: fetch-models
+          image: ghcr.io/ggml-org/llama.cpp:server-rocm-b11681
           command: ["/bin/sh", "-c"]
           args:
             - |
               set -eu
-              mkdir -p /models
-              # Download radiance model container (resumes if interrupted)
-              url="https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4/resolve/main/qwen3.8-27b-iq4r-l-v4.rad"
-              dest="/models/qwen3.8-27b-iq4r-l-v4.rad"
-              if [ -f "$dest" ]; then echo "Model present"; exit 0; fi
-              curl -fL --retry 5 -C - -o "$dest.partial" "$url"
-              mv "$dest.partial" "$dest"
-              echo "Download complete: $(du -h $dest | cut -f1)"
+              mkdir -p /cache/models
+              # Leftovers from the Radiance deployment; unusable on gfx1100
+              rm -f /cache/qwen3.8-27b-iq4r-l-v4.rad /cache/qwen3.8-27b-iq4r-l-v4.rad.partial
+              fetch() {
+                url="$1"; file="/cache/models/$2"; sha="$3"
+                if [ -f "$file" ]; then
+                  # same filename can exist from another repo (e.g. the
+                  # non-MTP build) - checksum decides; move, never delete
+                  if echo "$sha  $file" | sha256sum -c - 2>/dev/null; then
+                    echo "$2 present, sha ok"; return
+                  fi
+                  mv "$file" "$file.stale-$(date +%s)"
+                  echo "$2 sha mismatch, moved aside as stale"
+                fi
+                curl -fL --retry 5 -C - -o "$file.partial" "$url"
+                echo "$sha  $file.partial" | sha256sum -c -
+                mv "$file.partial" "$file"
+              }
+              fetch https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/5cb35eb3dcbf52dbce5f87dbc64df6aaffadcace/Qwen3.6-27B-Q6_K.gguf \
+                Qwen3.6-27B-Q6_K.gguf \
+                773f1bf0be0589d056ce05476a8a135b50494a3f2ecc3f8f0c4f2c3594bba02e
           env:
             - name: HOME
               value: /tmp
@@ -86,20 +120,106 @@ spec:
             limits:
               memory: 2Gi
           volumeMounts:
-            - name: models
-              mountPath: /models
+            - name: cache
+              mountPath: /cache
             - name: tmp
               mountPath: /tmp
       containers:
-        - name: radiance
-          image: stilldeadcode/radiance:2.2.0
+        - name: llama-server
+          # Official llama.cpp ROCm 7.2.1 build; its target list includes
+          # gfx1100. Pinned build (2026-10-16) - new enough for Qwen3.6,
+          # draft-mtp and ngram-mod (the draft-mtp rename landed 2026-05-13).
+          image: ghcr.io/ggml-org/llama.cpp:server-rocm-b11681
           args:
-            - --config
-            - /etc/radiance/radiance.yaml
+            - --model
+            - /cache/models/Qwen3.6-27B-Q6_K.gguf
+            # The model name clients send. NOTE: renamed from qwen3.8-27b -
+            # clients must request "Qwen3.6-27B-Q6_K" now (hermes local27b
+            # alias sends qwen3.8-27b; update or expect 404 model-not-found).
+            - --alias
+            - Qwen3.6-27B-Q6_K
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            # Everything on the GPU would need ~25.3 GiB (21.3 GiB weights
+            # + ~3.2 GiB KV at 131k + compute buffers) > 24 GiB of the XTX -
+            # ngl 999 OOMs. 56 of 64 layers on GPU; the CPU tail costs a few
+            # tok/s but makes it fit (verified: server loads + completes).
+            # Fail loudly on the rest (--fit off), then lower -c.
+            - --n-gpu-layers
+            - "56"
+            - --fit
+            - "off"
+            - --ctx-size
+            - "131000"
+            # Quantized V cache needs flash attention
+            - --flash-attn
+            - "on"
+            - --cache-type-k
+            - q5_0
+            - --cache-type-v
+            - q4_0
+            # KV caches for the MTP draft pass (draft-mtp heads share the
+            # target's context graph)
+            - --cache-type-k-draft
+            - q4_0
+            - --cache-type-v-draft
+            - q4_0
+            # Prompt cache off: single user, and every GiB of pinned host
+            # RAM matters with mlock + 21 GiB of weights
+            - --cache-ram
+            - "0"
+            # cache-idle-slots false: the flag defaults to enabled, so it
+            # must be disabled explicitly (presence-only pair)
+            - --no-cache-idle-slots
+            # One user, one slot: the whole KV pool goes to that request
+            - --parallel
+            - "1"
+            # Pin weights; no silent page-cache eviction under memory pressure.
+            # (b11681: --mlock is gone - it's a --load-mode value; bool flags
+            #  are presence-only pairs, and --reasoning takes on/off/auto.)
+            - --load-mode
+            - mlock
+            # Text-only: don't load the vision mmproj
+            - --no-mmproj
+            # Chat template (and its reasoning/tool-call tags) from the GGUF
+            - --jinja
+            # Thinking on: reasoning goes to reasoning_content
+            - --reasoning
+            - "on"
+            # Two-stage speculation: ngram-mod drafts verbatim continuations,
+            # the model's MTP heads draft the rest; MTP drafts 2 tokens,
+            # ngram-mod keeps drafts between 8 and 32 after a 24-token match.
+            - --spec-type
+            - draft-mtp,ngram-mod
+            - --spec-draft-n-max
+            - "2"
+            - --spec-ngram-mod-n-match
+            - "24"
+            - --spec-ngram-mod-n-min
+            - "8"
+            - --spec-ngram-mod-n-max
+            - "32"
+            # Qwen3.6's recommended thinking-mode sampling (model card);
+            # llama.cpp's defaults differ (temp 0.8, top-k 40, min-p 0.05).
+            # Requests can still override these.
+            - --temp
+            - "0.6"
+            - --top-p
+            - "0.95"
+            - --top-k
+            - "20"
+            - --min-p
+            - "0.0"
+            - --presence-penalty
+            - "0.0"
+            - --repeat-penalty
+            - "1.0"
           env:
             - name: HOME
               value: /tmp
-            # gfx1100 is natively supported by libr3d — do NOT set HSA_OVERRIDE_GFX_VERSION
+            # gfx1100 is natively supported - do NOT set HSA_OVERRIDE_GFX_VERSION.
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -112,46 +232,44 @@ spec:
             - name: http
               containerPort: 8000
               protocol: TCP
+          # mlock pins the 21 GiB of weights in host RAM (not reclaimable
+          # page cache), so request the real footprint instead of 8Gi.
           resources:
             requests:
               cpu: "4"
-              memory: 20Gi
+              memory: 24Gi
             limits:
               amd.com/gpu: 1
-              memory: 24Gi
+              memory: 32Gi
+          # The init container did the download; this is load only.
+          # /health is 503 while loading, 200 once ready.
           startupProbe:
             httpGet:
-              path: /
+              path: /health
               port: http
             periodSeconds: 15
             failureThreshold: 40
           readinessProbe:
             httpGet:
-              path: /
+              path: /health
               port: http
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /
+              path: /health
               port: http
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 5
           volumeMounts:
-            - name: models
-              mountPath: /models
-              readOnly: true
-            - name: config
-              mountPath: /etc/radiance
+            - name: cache
+              mountPath: /cache
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: models
+        - name: cache
           persistentVolumeClaim:
             claimName: models
-        - name: config
-          configMap:
-            name: radiance-config
         - name: tmp
           emptyDir:
             sizeLimit: 1Gi
