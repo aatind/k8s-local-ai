@@ -1,6 +1,6 @@
 ---
 # Hermes WebUI (https://github.com/nesquena/hermes-webui) with Hermes Agent
-# running in-process, using the local qwen3.8-27b as its model.
+# running in-process, using the local Qwen3.6-27B (llms/qwen3_8) as its model.
 #
 # The WebUI image doesn't ship the agent: at startup it installs the agent's
 # Python package from source found at ~/.hermes/hermes-agent. The first init
