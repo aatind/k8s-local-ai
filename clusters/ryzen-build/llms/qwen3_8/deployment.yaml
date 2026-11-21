@@ -8,16 +8,16 @@
 # Model: qwen3.8-27b-iq4r-l-v4.rad (17.4 GiB, IQR-V4 trellis quant, ~4.5 bits/weight)
 #   - StillDeadcode's radiance-optimized container with weights, tokenizer, chat template
 #   - IQ4R-L ("large" trellis) is the best quality that fits on one 24 GB card
-#     with headroom for KV cache (i8, 131K context, 4 sequences) and compute buffers.
+#     with headroom for KV cache (i8, 250K context, 2 sequences) and compute buffers.
 #   - Source: https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4
 #
 # Radiance config is in configmap.yaml (mounted as /etc/radiance/radiance.yaml).
-# Server keys: tp=1, max-num-seqs=4, max-model-len=131072, kv-cache-dtype=i8.
+# Server keys: tp=1, max-num-seqs=2, max-model-len=250000, kv-cache-dtype=i8.
 #
 # VRAM budget (24 GiB):
 #   Weights (IQ4R-L):  ~17.4 GiB
-#   KV cache (i8, 4 seq x 131K): ~4 GiB
-#   Compute buffers + gpu-headroom: ~2.6 GiB
+#   KV cache (i8, 2 seq x 250K): ~3.8 GiB
+#   Compute buffers + gpu-headroom: ~2.8 GiB
 #
 # API: OpenAI-compatible at /v1 (chat, completions), same port 8000 / NodePort 30800.
 # Dashboard at http://<node-ip>:30800/
