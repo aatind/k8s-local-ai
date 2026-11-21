@@ -6,8 +6,14 @@ metadata:
   namespace: qwen38
 data:
   radiance.yaml: |
+    memory:
+      gpu-headroom-mib: 160
+    scheduler:
+      load-timeout: 600s
     server:
       port: 8000
+      host: "::"
+      api-key-env: davdav
     models:
       qwen3-8-27b:
         model: /cache/models/qwen3.8-27b-iq4r-l-v4.rad
