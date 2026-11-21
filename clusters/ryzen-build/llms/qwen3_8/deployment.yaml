@@ -63,12 +63,10 @@ spec:
           args:
             - |
               set -eu
-              mkdir -p /cache/models
-              # Remove old llama.cpp GGUF (21 GiB) — no longer needed
-              rm -f /cache/models/Qwen3.6-27B-Q6_K.gguf
+              mkdir -p /models
               # Download radiance model container (resumes if interrupted)
               url="https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4/resolve/main/qwen3.8-27b-iq4r-l-v4.rad"
-              dest="/cache/models/qwen3.8-27b-iq4r-l-v4.rad"
+              dest="/models/qwen3.8-27b-iq4r-l-v4.rad"
               if [ -f "$dest" ]; then echo "Model present"; exit 0; fi
               curl -fL --retry 5 -C - -o "$dest.partial" "$url"
               mv "$dest.partial" "$dest"
@@ -88,8 +86,8 @@ spec:
             limits:
               memory: 2Gi
           volumeMounts:
-            - name: cache
-              mountPath: /cache
+            - name: models
+              mountPath: /models
             - name: tmp
               mountPath: /tmp
       containers:
@@ -140,17 +138,17 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 5
           volumeMounts:
-            - name: cache
-              mountPath: /cache
+            - name: models
+              mountPath: /models
               readOnly: true
             - name: config
               mountPath: /etc/radiance
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: cache
+        - name: models
           persistentVolumeClaim:
-            claimName: qwen3-8-27b-cache
+            claimName: models
         - name: config
           configMap:
             name: radiance-config
