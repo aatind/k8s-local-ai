@@ -1,0 +1,19 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: radiance-config
+  namespace: qwen38
+data:
+  radiance.yaml: |
+    server:
+      port: 8000
+    memory:
+      gpu-headroom-mib: 96
+    models:
+      qwen3-8-27b:
+        model: /cache/models/qwen3.8-27b-iq4r-l-v4.rad
+        tp: 1
+        max-num-seqs: 4
+        max-model-len: 131072
+        kv-cache-dtype: i8
